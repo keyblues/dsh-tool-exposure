@@ -1,0 +1,36 @@
+# dsh-tool-exposure — 按角色（agent preset）管理第三方插件工具的暴露面。
+#
+# Host 行：策略引擎 + 同源路由（矩阵页读写）。
+# Client 半：Settings →「工具暴露」矩阵页（settings.section）。
+#
+# config 说明：
+#   unlisted  open | closed   未在 roles 中出现的角色：open=不限制，closed=看不到受管工具
+#   sources   <组id>: { label, match: [通配符] }
+#             match 只支持 * 与 ?；Host 侧对当前全局工具名展开，未匹配到工具的组会给出警告。
+#   roles     <preset id>: { mode: open | allow, groups: {组id: on|off}, tools: {工具名: on|off} }
+#             mode=open 基线全给、mode=allow 基线全不给；groups 次之；tools 最后生效（单工具例外）。
+#
+# 保存方式：矩阵页保存会经 configEditor 写回本 profile 的 cordis.patch.yml 中本行 config，
+# 并以「仅新建会话生效」的快照语义应用；已有会话保持创建时的工具面。
+- insert:
+    - id: tool-exposure
+      name: 'dsh-tool-exposure'
+      config:
+        unlisted: open
+        sources:
+          fofatoto:
+            label: FOFA 测绘
+            match: ['fofa_*']
+          icp:
+            label: ICP 备案
+            match: ['mcp__icp__*']
+          fengniao:
+            label: 企业工商
+            match: ['fengniao_*']
+          everything:
+            label: 全盘检索
+            match: ['everything_*']
+          hdc:
+            label: 鸿蒙设备与 DevEco
+            match: ['hdc_*', 'hms_*']
+        roles: {}

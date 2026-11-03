@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tool Exposure",
+    "description": "Manage which roles (agent presets) can see the tools registered by third-party plugins, with a role × tool-group matrix."
+  }
+}

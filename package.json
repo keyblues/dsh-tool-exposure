@@ -1,0 +1,64 @@
+{
+  "name": "dsh-tool-exposure",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness (DSH) plugin: role-scoped tool exposure for agent presets — a Settings page that raises or lowers which tools registered by third-party plugins each role can see, applied through ctx.tools.restrict when the agent is created (snapshot semantics). DSH 插件：按角色（agent preset）管理第三方插件注册工具的暴露面，提供「角色 × 工具组」矩阵页，经 ctx.tools.restrict 在 agent 创建时生效（快照语义，配置保存只影响新建会话）。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-preset",
+    "tools",
+    "settings",
+    "permissions",
+    "tool-exposure",
+    "access-control",
+    "role-based-access",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "keyblues",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/keyblues/dsh-tool-exposure.git"
+  },
+  "homepage": "https://github.com/keyblues/dsh-tool-exposure#readme",
+  "bugs": {
+    "url": "https://github.com/keyblues/dsh-tool-exposure/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/host-policy.mjs && node test/static-checks.mjs && node test/client-smoke.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  }
+}
