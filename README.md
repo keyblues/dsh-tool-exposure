@@ -1,39 +1,83 @@
+![工具暴露 · 按角色管理 DSH 工具可见性](docs/images/readme-cover.png)
+
 # 工具暴露 · dsh-tool-exposure
 
-在 DeepSeek Harness（DSH）里按角色管理工具可见性。你可以整组开启或隐藏一个插件或 MCP 服务器提供的工具，再为单个工具设置例外。保存后的规则用于新建会话。
+用同一个页面为标准模式、极简模式和自定义角色分别设置可见工具。按官方工具、插件或 MCP 服务器成组调整，也可以为单个工具设置例外。
 
-[安装](#安装) · [使用指南](docs/usage.md) · [配置参考](docs/configuration.md) · [开发指南](docs/development.md)
-
-![工具暴露页面，左侧显示角色，右侧显示标准模式下的官方工具、独立 MCP 服务器和插件工具组](docs/images/tool-exposure.png)
+[安装](#安装) · [快速上手](#快速上手) · [工具分组](#工具分组) · [文档](#文档)
 
 ## 安装
 
-适用于使用官方 `dsh-base` 的 DSH 环境。支持的 DSH 版本范围为 `>=0.2.2-rc.3 <0.3.0-0`。Node.js 版 DSH 需要 Node.js 24.9 或更高版本。
+适用于使用官方 `dsh-base` 的 DSH，支持版本 `>=0.2.2-rc.3 <0.3.0-0`。使用 Node.js 运行 DSH 时，需要 Node.js 24.9 或更高版本。
 
-1. 在 **DSH 左侧菜单**打开「插件」。
-2. 点击右上角「添加插件」旁的下拉箭头，选择「安装第三方插件」。
-3. 在弹窗的输入框中粘贴 GitHub 仓库链接。
+### 在 DSH 界面从 npm 安装（推荐）
 
-   ```text
-   https://github.com/keyblues/dsh-tool-exposure
-   ```
+1. 打开 DSH 左侧菜单中的「插件」。
+2. 点击「添加插件」旁的下拉箭头，选择「安装第三方插件」。
+3. 在弹窗中输入 `dsh-tool-exposure`，点击「安装」。[查看 npm 包](https://www.npmjs.com/package/dsh-tool-exposure)
 
-4. 点击「安装」。安装完成后重启 DSH，打开左侧菜单中带眼睛图标的「工具暴露」。如果入口收纳在「更多」里，可在其中打开或固定到侧栏。
+### 用 DSH CLI 从 npm 安装
 
-![在 DSH 的安装第三方插件对话框中粘贴 GitHub 仓库链接](docs/images/install-from-github.png)
+**Web profile**
 
-也可以在同一个输入框填写 npm 包名 `dsh-tool-exposure`。[查看 npm 包](https://www.npmjs.com/package/dsh-tool-exposure)
+```sh
+dsh plugin --profile web add dsh-tool-exposure
+```
 
-## 快速使用
+**Desktop profile**
 
-1. 选择要配置的角色。角色卡片显示名称、说明、预设 ID 和可见工具数量。
-2. 在「默认规则」里选「默认开放」或「白名单」。前者适合隐藏少数组，后者适合只放行指定工具。
-3. 用组开关批量设置工具，或点击组名展开后调整单个工具。每个已注册工具的全局 MCP 服务器各自成组，其他官方工具集中展示，第三方插件组显示插件名称和图标。
-4. 展开「最终可见工具」核对结果，点击「保存」，再用同一个角色新建会话。
+先启动一次桌面版以初始化 profile，完全退出应用后，用**桌面版自带的 `dsh`** 执行命令。[DSH 桌面版 CLI 文档](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.3/apps/desktop/README.zh.md#bundled-command-runtime)
 
-首次安装会自动识别当前角色和工具，所有角色默认开放。按服务器调节 MCP、处理保存冲突和恢复会话工具限制的方法见[使用指南](docs/usage.md)。
+```sh
+dsh plugin --profile desktop add dsh-tool-exposure
+```
 
-Tool Exposure manages which inherited tools each DeepSeek Harness agent preset can see. Global MCP servers have independent tool groups, and saved policies apply to new sessions.
+可以从桌面端的「管理 dsh 命令…」注册内置 CLI，也可以直接调用安装目录下的 `resources/runtime/cli/bin/dsh`。Windows 使用同目录下的 `dsh.cmd`。
+
+<details>
+<summary>从 GitHub 仓库安装</summary>
+
+在 DSH 的「安装第三方插件」弹窗中粘贴本仓库链接，点击「安装」。
+
+```text
+https://github.com/keyblues/dsh-tool-exposure
+```
+
+![在 DSH 的安装第三方插件弹窗里填写 GitHub 仓库链接](docs/images/install-from-github.png)
+
+</details>
+
+安装完成后重启对应的 DSH，从左侧菜单打开带眼睛图标的「工具暴露」。入口收纳在「更多」时，可以从那里打开或固定到侧栏。
+
+## 快速上手
+
+首次安装会自动读取当前角色和工具，各角色默认开放。
+
+1. **选择角色。** 根据名称或预设 ID 找到要编辑的角色，例如「标准模式」。
+2. **选默认规则。** 「默认开放」适合隐藏少量工具。「白名单」适合只开放选中的工具。
+3. **调整组和工具。** 关闭某个 MCP 服务器组可隐藏它提供的全部工具。展开组后，可以单独开启需要保留的工具。
+4. **核对并保存。** 展开「最终可见工具」查看草稿结果。保存后用同一个角色新建会话，新会话会采用这套规则。
+
+![工具暴露实拍，左侧是角色列表，右侧是官方工具组、两个独立 MCP 服务器组和示例插件组](docs/images/tool-exposure.png)
+
+## 工具分组
+
+| 来源 | 页面中的分组方式 |
+| --- | --- |
+| 官方插件 | 汇总在「官方工具」组，展开可查看每项工具的提供插件。 |
+| 全局 MCP | 每个已注册工具的服务器单独成组，组名使用服务器名称。 |
+| 第三方插件 | 按注册工具的插件分组，优先展示插件名称和图标。 |
+| 自定义组 | 在「高级设置 → 管理工具组」用工具名或通配符匹配。 |
+
+可以按工具名、说明、插件名或 MCP 服务器名搜索，再筛选「仅可见」或「仅隐藏」。筛选后，整组开关仍作用于该组的全部工具。
+
+## 文档
+
+- 查找工具、处理草稿与升级插件。[使用指南](docs/usage.md)
+- 查看分组顺序、角色规则及 YAML 示例。[配置参考](docs/configuration.md)
+- 了解本地调试、测试和发布流程。[开发指南](docs/development.md)
+
+Tool Exposure manages which inherited tools each DeepSeek Harness agent preset can see. Saved policies apply to new sessions.
 
 ## 许可
 
