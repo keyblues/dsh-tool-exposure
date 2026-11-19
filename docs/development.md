@@ -12,11 +12,13 @@
 | --- | --- |
 | [cordis.patch.yml](../cordis.patch.yml) | 加载来源记录服务和工具暴露策略。组合包使用继承官方实现的工具服务承接注册。 |
 | [registry.js](../registry.js)、[providers.js](../providers.js) | 记录 Cordis Loader 注册上下文，读取全局和预设的继承目录，识别官方、插件与全局 MCP 来源。 |
-| [index.js](../index.js) | 生成角色工具清单，计算策略，调用 DSH 的 `tools.restrict({ deny })`，并提供读写配置与诊断路由。 |
+| [index.js](../index.js) | 生成角色工具清单，通过 DSH 的 `tools.restrict()` 应用可见性规则，并提供读写配置与诊断路由。 |
 | [client.js](../client.js) | 在 `sidebar.panellist` 和 `main` 注册入口与页面，管理草稿、筛选、保存和重新扫描。 |
 | [icon.svg](../icon.svg)、[locale](../locale/) | 插件主图标及 DSH 读取的中英文名称与说明。 |
 
-读取预设目录时，宿主挂载临时作用域并在读取后释放。创建会话或子代理时应用策略；如果预设仍在挂载，宿主在后续 `agent/pre-step` 补应用，最多尝试三次，然后使用未列出角色的规则。尚未开始工作的 Agent 会在工具异步注册时重新计算，开始工作后使用已应用的策略。保存通过配置版本校验串行写入，同时编辑时较早读取的版本会收到冲突提示。
+读取预设目录时，宿主挂载临时作用域并在读取后释放。创建会话或子代理时记录配置。切换角色、变更预设或注册新工具后，宿主按当前绑定的角色和会话记录的配置重新计算可见性。未绑定预设时，立即使用未列出角色的规则。工具服务在生成每轮工具清单前复核规则。停用插件会解除已有会话的限制，配置热重载时会恢复这些会话原有的规则。
+
+保存通过配置版本校验串行写入，同时编辑时较早读取的版本会收到冲突提示。
 
 ## 运行检查
 
@@ -38,15 +40,15 @@ README 的功能截图使用独立配置中的示例角色、插件和 MCP 服�
 
 ## 发布 npm 包
 
-更新 `package.json` 的版本并推送后，在 GitHub 发布对应的 Release。标签使用 `v` 加完整版本号，例如 `v1.0.2`。
+更新 `package.json` 的版本并推送后，等对应提交的 Actions 检查通过，再在 GitHub 发布 Release。标签使用 `v` 加完整版本号，例如 `v1.0.2`。
 
-GitHub Actions 从该标签对应的提交运行测试并打包，通过 npm Trusted Publishing 发布。稳定版使用 `latest`，预发行版使用 `next`。工作流与 npm 上的发布状态可从 Release 对应的 Actions 记录查看。
+PR 和 `main` 的推送会打包候选 `.tgz`，用独立 DSH profile 验证全新安装、启动和从 `1.0.2` 带着已保存规则升级。发布 Release 时，Actions 再检查标签对应的提交，并通过 npm Trusted Publishing 发布已验证的同一份 `.tgz`。稳定版使用 `latest`，预发行版使用 `next`。
 
 该包通过 `keyblues/dsh-tool-exposure` 仓库中的 `publish-npm.yml` 使用 Trusted Publishing。[npm 配置说明](https://docs.npmjs.com/trusted-publishers/)
 
 ## 本机诊断
 
-路由前缀为 `/plugins/dsh-tool-exposure`。从当前 DSH Web 源访问时，附上 `x-dsh-tool-exposure-plugin: 1` 请求头。宿主同时校验请求的 `Host` 和 `Origin`。
+路由前缀为 `/plugins/dsh-tool-exposure`。从已登录的 DSH 界面访问，附上 `x-dsh-tool-exposure-plugin: 1` 请求头。宿主使用 DSH 的连接服务校验请求来源和身份。保存、解除限制和强制重算要求 DSH 界面的会话凭据。
 
 | 方法与端点 | 用途 |
 | --- | --- |
@@ -56,4 +58,4 @@ GitHub Actions 从该标签对应的提交运行测试并打包，通过 npm Tru
 | `GET /debug/agents` | 查看已加载 Agent 的预设、当前限制和启动状态。 |
 | `POST /save` | 校验并提交草稿。版本冲突返回 `409`，JSON 请求体上限为 256 KiB。 |
 | `POST /reset` | 解除本插件对当前已加载会话和子代理的限制。 |
-| `POST /debug/apply` | 为当前已加载会话和子代理强制重算策略，供本机调试。 |
+| `POST /debug/apply` | 为当前已加载会话和子代理重算策略，逐个返回结果和失败原因。 |

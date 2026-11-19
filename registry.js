@@ -8,6 +8,13 @@ export default class ToolExposureRegistry extends ToolsService {
   catalogRevision = 0;
   presetCatalogs = new Map();
 
+  /** Reconcile the policy before the host admits tools for the model step. */
+  async resolve(context) {
+    context.signal.throwIfAborted();
+    this.ctx.emit('dsh-tool-exposure/before-tool-resolution', context.agent);
+    return super.resolve(context);
+  }
+
   /** Preserve official registration behavior and release its metadata with the same disposer. */
   register(definition, options = {}) {
     const ctx = this.ctx;
@@ -51,6 +58,11 @@ export default class ToolExposureRegistry extends ToolsService {
   /** Read the exact preset revision inherited by a live agent. */
   agentToolCatalog(agent) {
     return this.toolCatalog(scopeOf(agent.ctx));
+  }
+
+  /** Preset rebinding can change this chain without a new tool registration. */
+  agentToolScopeChain(agent) {
+    return scopeChainOf(scopeOf(agent.ctx));
   }
 
   /** Bind a temporary read scope, retain no Session, and always release the binding. */

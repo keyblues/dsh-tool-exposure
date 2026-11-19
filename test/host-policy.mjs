@@ -7,6 +7,7 @@
  *
  * Run: node test/host-policy.mjs
  */
+import assert from 'node:assert/strict';
 import { __test as T } from '../index.js';
 
 let failures = 0;
@@ -290,7 +291,7 @@ function makeAgent(roleId) {
       schemas: () => SCHEMAS,
       get: (name) => SCHEMAS.find((schema) => schema.name === name),
       restrict: (filter) => {
-        const record = { deny: [...filter.deny] };
+        const record = Object.fromEntries(Object.entries(filter).map(([key, names]) => [key, [...names]]));
         agentCtx.restrictions.push(record);
         return () => {
           const at = agentCtx.restrictions.indexOf(record);
@@ -308,15 +309,28 @@ function makeAgent(roleId) {
   return { ctx: agentCtx };
 }
 
+const browserPeer = { id: 'browser', principal: { kind: 'owner' } };
+const fakeConnection = {
+  browserPeer,
+  admit({ headers }) {
+    if (headers.host !== '127.0.0.1:1130') return { rejection: 403 };
+    if (headers.cookie === 'fixture=browser') return { peer: browserPeer };
+    if (headers.cookie === 'fixture=api') return { peer: { ...browserPeer, id: 'api' } };
+    return { rejection: 401 };
+  },
+};
+
 function makePluginCtx(agents) {
   const presets = {
     composedPreset: (agentCtx) => (agentCtx && typeof agentCtx.__role === 'string' ? agentCtx.__role : undefined),
   };
   return {
     tools: fakeHostTools(),
+    effect: (fn) => fn(),
     get(name) {
       if (name === 'agentPresets') return presets;
       if (name === 'agents') return { list: () => agents };
+      if (name === 'connection') return fakeConnection;
       return undefined;
     },
   };
@@ -330,23 +344,21 @@ const APPLY_CONFIG = T.normalizeConfig({
   },
 });
 
-check('applyAgentPolicy: unresolved role at creation becomes PENDING, no restriction yet', () => {
+check('applyAgentPolicy: unresolved role immediately uses the open fallback', () => {
   const agent = makeAgent(undefined);
   const ctx = makePluginCtx([agent]);
   const applied = T.applyAgentPolicy(ctx, agent, APPLY_CONFIG);
-  eq(applied, false, 'applied');
+  eq(applied, true, 'applied');
   eq(agent.ctx.restrictions.length, 0, 'restrictions');
-  eq(T.readAgentState(agent, T.PENDING), true, 'pending');
 });
 
-check('applyAgentPolicy: pre-step retry resolves role and applies the allow-list', () => {
+check('applyAgentPolicy: a newly bound role replaces the fallback', () => {
   const agent = makeAgent(undefined);
   const ctx = makePluginCtx([agent]);
   T.applyAgentPolicy(ctx, agent, APPLY_CONFIG);
   agent.ctx.__role = 'expert';
-  const applied = T.applyAgentPolicy(ctx, agent, APPLY_CONFIG, { allowUnresolved: true });
+  const applied = T.applyAgentPolicy(ctx, agent, APPLY_CONFIG);
   eq(applied, true, 'applied');
-  eq(T.readAgentState(agent, T.PENDING), false, 'pending cleared');
   eq(agent.ctx.restrictions.length, 1, 'one restriction');
   eq(agent.ctx.restrictions[0].deny, ['hdc_shell'], 'deny list');
 });
@@ -397,29 +409,31 @@ check('liftAllRestrictions: disposes, freezes the agent, and reports the count',
   eq(lifted, 1, 'lifted');
   eq(agent.ctx.restrictions.length, 0, 'restriction gone');
   eq(T.readAgentState(agent, T.LEGACY), true, 'frozen as legacy');
-  eq(T.readAgentState(agent, T.PENDING), false, 'pending cleared');
+  eq(T.readAgentState(agent, T.APPLIED), undefined, 'cleared applied state');
 });
 
-check('resyncUnstarted: only unstarted non-legacy agents are re-evaluated', () => {
-  const pending = makeAgent(undefined);
-  const started = makeAgent(undefined);
-  const legacy = makeAgent(undefined);
-  const ctx = makePluginCtx([pending, started, legacy]);
-  T.markLiveAgentsLegacy(ctx);
-  // undo legacy for two of them: emulate agents created after plugin load
-  T.setAgentState(pending, T.LEGACY, false);
-  T.setAgentState(started, T.LEGACY, false);
+check('catalog refresh keeps the original rule for started agents across a config reload', () => {
+  const started = makeAgent('standard');
+  const legacy = makeAgent('standard');
+  const allowed = { name: 'catalog_lookup', provider: { plugin: '@deepseek-ai/dsh-mcp-client', mcpServer: 'catalog' } };
+  const registered = [];
+  started.ctx.tools.agentToolCatalog = () => registered;
+  const config = T.normalizeConfig({ roles: { standard: { mode: 'allow', groups: { '@mcp/catalog': 'on' } } } });
+  const ctx = makePluginCtx([started, legacy]);
+  T.applyAgentPolicy(ctx, started, config);
+  eq(started.ctx.restrictions, [{ allow: [] }], 'empty catalog still establishes an allow-list');
   T.setAgentState(started, T.STARTED, true);
-  pending.ctx.__role = 'expert';
-  started.ctx.__role = 'expert';
-  legacy.ctx.__role = 'expert';
-  T.resyncUnstarted(ctx, APPLY_CONFIG);
-  eq(pending.ctx.restrictions.length, 1, 'pending agent restricted');
-  eq(started.ctx.restrictions.length, 0, 'started agent untouched');
-  eq(legacy.ctx.restrictions.length, 0, 'legacy agent untouched');
+  T.markLiveAgentsLegacy(ctx);
+  registered.push(allowed, { name: 'archive_lookup', provider: { plugin: '@deepseek-ai/dsh-mcp-client', mcpServer: 'archive' } });
+  T.refreshAgentPolicies(ctx);
+  eq(started.ctx.restrictions, [{ allow: ['catalog_lookup'] }], 'only the approved server is visible');
+  eq(legacy.ctx.restrictions, [], 'pre-existing session keeps its host state');
+  T.liftAllRestrictions(ctx);
+  T.refreshAgentPolicies(ctx);
+  eq(started.ctx.restrictions, [], 'manual reset survives catalog changes');
 });
 
-check('applyAgentPolicy: a failing restrict restores the previous mask (no fail-open)', () => {
+check('applyAgentPolicy: a failed replacement preserves the previous mask', () => {
   const agent = makeAgent('standard');
   const ctx = makePluginCtx([agent]);
   const originalRestrict = agent.ctx.tools.restrict;
@@ -434,11 +448,10 @@ check('applyAgentPolicy: a failing restrict restores the previous mask (no fail-
     sources: { fofa: { match: ['fofa_*'] }, device: { match: ['hdc_*'] } },
     roles: { standard: { mode: 'open', groups: { device: 'off' }, tools: { fofa_search: 'off' } } },
   });
-  const applied = T.applyAgentPolicy(ctx, agent, changed);
-  eq(applied, false, 'apply fails');
-  eq(agent.ctx.restrictions.length, 1, 'previous restriction restored');
-  eq(agent.ctx.restrictions[0].deny, ['hdc_shell'], 'restored deny');
-  eq(T.readAgentState(agent, T.APPLIED).signature, 'standard|hdc_shell', 'signature restored');
+  assert.throws(() => T.applyAgentPolicy(ctx, agent, changed, { force: true }), /boom/);
+  eq(agent.ctx.restrictions.length, 1, 'previous restriction retained');
+  eq(agent.ctx.restrictions[0].deny, ['hdc_shell'], 'retained deny');
+  eq(T.readAgentState(agent, T.APPLIED).signature, 'standard|hdc_shell', 'signature retained');
 });
 
 /* --------------------- new regression checks (audit) ------------------- */
@@ -511,7 +524,7 @@ check('applyAgentPolicy: frozen agent state is tracked via WeakMap (no repeated 
   eq(T.readAgentState(agent, T.LEGACY), true, 'state read back');
 });
 
-check('applyPendingPolicy: retries unresolved role, then applies unlisted after 3 attempts', () => {
+check('applyAgentPolicy: unresolved role immediately uses the closed fallback', () => {
   const closed = T.normalizeConfig({
     unlisted: 'closed',
     sources: { fofa: { match: ['fofa_*'] } },
@@ -519,14 +532,7 @@ check('applyPendingPolicy: retries unresolved role, then applies unlisted after 
   });
   const agent = makeAgent(undefined);
   const ctx = makePluginCtx([agent]);
-  T.setAgentState(agent, T.PENDING, true);
-  T.applyPendingPolicy(ctx, agent, closed);
-  eq(T.readAgentState(agent, T.PENDING), true, 'still pending after 1');
-  T.applyPendingPolicy(ctx, agent, closed);
-  eq(T.readAgentState(agent, T.PENDING), true, 'still pending after 2');
-  eq(agent.ctx.restrictions.length, 0, 'not applied yet');
-  T.applyPendingPolicy(ctx, agent, closed);
-  eq(T.readAgentState(agent, T.PENDING), false, 'gave up after 3');
+  T.applyAgentPolicy(ctx, agent, closed);
   eq(agent.ctx.restrictions.length, 1, 'unlisted applied');
   eq(agent.ctx.restrictions[0].deny, ['fofa_search'], 'unlisted deny');
 });
@@ -602,30 +608,6 @@ check('normalizeConfig: comma-separated match strings split like the page does',
   eq(index.owner.get('hms_build'), 'b', 'second group');
 });
 
-check('isRequestOriginAllowed: rejects DNS-rebinding style Host/Origin', () => {
-  const ctx = { get: (name) => (name === 'webServer' ? { getOrigin: () => 'http://127.0.0.1:1130' } : undefined) };
-  const req = (headers) => ({ headers });
-  eq(T.isRequestOriginAllowed(ctx, req({ host: '127.0.0.1:1130' })), true, 'expected host');
-  eq(T.isRequestOriginAllowed(ctx, req({ host: '127.0.0.1:1130', origin: 'http://127.0.0.1:1130' })), true, 'same origin');
-  eq(T.isRequestOriginAllowed(ctx, req({ host: 'localhost:1130' })), true, 'loopback alias');
-  eq(T.isRequestOriginAllowed(ctx, req({ host: 'evil.example:1130', origin: 'http://evil.example:1130' })), false, 'rebinding host');
-  eq(T.isRequestOriginAllowed(ctx, req({ host: '127.0.0.1:1130', origin: 'http://evil.example:1130' })), false, 'cross origin');
-  eq(T.isRequestOriginAllowed(ctx, req({})), false, 'missing host');
-  const noOrigin = { get: () => undefined };
-  eq(T.isRequestOriginAllowed(noOrigin, req({ host: '127.0.0.1:1130' })), true, 'loopback fallback');
-  eq(T.isRequestOriginAllowed(noOrigin, req({ host: 'evil.example:1130' })), false, 'fallback blocks rebinding');
-  eq(
-    T.isRequestOriginAllowed(noOrigin, req({ host: '127.0.0.1:1130', origin: 'http://evil.example:1130' })),
-    false,
-    'fallback rejects cross origin',
-  );
-  eq(
-    T.isRequestOriginAllowed(noOrigin, req({ host: '127.0.0.1:1130', origin: 'http://localhost:1130' })),
-    true,
-    'fallback accepts loopback origin',
-  );
-});
-
 /* --------------------------- async inventory --------------------------- */
 
 inventoryCase = await inventoryFixture();
@@ -661,8 +643,8 @@ const brokenTools = {
 const brokenAgent = makeAgent('expert');
 brokenAgent.ctx.tools = brokenTools;
 const brokenCtx = makePluginCtx([brokenAgent]);
-check('registry read failure: fail-closed (no APPLIED, no restriction)', () => {
-  eq(T.applyAgentPolicy(brokenCtx, brokenAgent, APPLY_CONFIG), false, 'apply skipped');
+check('registry read failure: surfaces an error before marking the policy applied', () => {
+  assert.throws(() => T.applyAgentPolicy(brokenCtx, brokenAgent, APPLY_CONFIG), /Unable to read the agent tool catalog/);
   eq(T.readAgentState(brokenAgent, T.APPLIED), undefined, 'no APPLIED signature');
   eq(brokenAgent.ctx.restrictions.length, 0, 'no restriction registered');
 });
@@ -803,6 +785,7 @@ function routeCtx(editor, agents) {
   };
   return {
     tools,
+    effect: (fn) => fn(),
     get(name) {
       if (name === 'tools') return tools;
       if (name === 'agentPresets') {
@@ -813,7 +796,7 @@ function routeCtx(editor, agents) {
       }
       if (name === 'configEditor') return editor === null ? undefined : editor || { edit() {}, entries: () => [] };
       if (name === 'agents') return { list: () => agents || [] };
-      if (name === 'webServer') return { getOrigin: () => 'http://127.0.0.1:1130' };
+      if (name === 'connection') return fakeConnection;
       return undefined;
     },
   };
@@ -827,7 +810,7 @@ const routeEditor = {
   },
 };
 const routeHandler = T.createRouteHandler(routeCtx(routeEditor), ROUTE_CONFIG);
-const guard = { 'x-dsh-tool-exposure-plugin': '1', host: '127.0.0.1:1130' };
+const guard = { 'x-dsh-tool-exposure-plugin': '1', host: '127.0.0.1:1130', cookie: 'fixture=browser' };
 const noGuard = await callRoute(routeHandler, fakeRequest('GET', '/plugins/dsh-tool-exposure/ping', { host: '127.0.0.1:1130' }));
 const spoofed = await callRoute(
   routeHandler,
@@ -856,6 +839,14 @@ check('route: guard header and Host/Origin validation', () => {
   eq(pinged.status, 200, 'same-origin ping');
   eq(pinged.payload.ok, true, 'ping ok');
   eq(notFound.status, 404, 'unknown route');
+});
+
+const missingConnection = T.createRouteHandler({ get: () => undefined }, ROUTE_CONFIG);
+const missingConnectionResult = await callRoute(missingConnection, fakeRequest('POST', `${T.ROUTE_PREFIX}/reset`, guard));
+const apiPeerResult = await callRoute(routeHandler, fakeRequest('POST', `${T.ROUTE_PREFIX}/reset`, { ...guard, cookie: 'fixture=api' }));
+check('route: state changes require the authenticated browser peer', () => {
+  eq(missingConnectionResult.status, 503, 'no authentication service');
+  eq(apiPeerResult.status, 403, 'API peer cannot reset rules');
 });
 
 check('route: /save validates roles and writes through configEditor', () => {
@@ -941,6 +932,17 @@ const debugAgent = makeAgent('expert');
 T.setAgentState(debugAgent, T.LEGACY, true);
 const debugHandler = T.createRouteHandler(routeCtx(undefined, [debugAgent]), ROUTE_CONFIG);
 const debugResult = await callRoute(debugHandler, fakeRequest('POST', '/plugins/dsh-tool-exposure/debug/apply', guard));
+const failingAgent = makeAgent('expert');
+failingAgent.ctx.tools.restrict = () => { throw new Error('fixture restriction failed'); };
+const debugFailure = await callRoute(
+  T.createRouteHandler(makePluginCtx([failingAgent]), APPLY_CONFIG),
+  fakeRequest('POST', `${T.ROUTE_PREFIX}/debug/apply`, guard),
+);
+check('route: /debug/apply reports the actual failure', () => {
+  eq(debugFailure.payload.ok, false, 'batch status');
+  eq(debugFailure.payload.results[0].ok, false, 'agent status');
+  eq(debugFailure.payload.results[0].error, 'fixture restriction failed', 'failure reason');
+});
 const scopedAgent = makeAgent('expert');
 scopedAgent.ctx.tools.agentToolCatalog = () => [
   { name: 'inherited_read', provider: { plugin: '@deepseek-ai/dsh-tool-files', official: true } },
@@ -977,7 +979,7 @@ check('route: /reset lifts and /debug/apply clears legacy', () => {
 });
 
 const { apply: applyPlugin } = await import(new URL('../index.js', import.meta.url).href + `?wiring=${Date.now()}`);
-check('apply(): event wiring (created/pre-step/claimed/disposed/tools-change)', () => {
+check('apply(): event wiring (created/tool-resolution/claimed/disposed/tools-change)', () => {
   const handlers = {};
   const presets = {
     composedPreset: (agentCtx) => agentCtx.__role,
@@ -995,8 +997,7 @@ check('apply(): event wiring (created/pre-step/claimed/disposed/tools-change)', 
       return () => {};
     },
     effect(fn) {
-      fn();
-      return () => {};
+      return fn();
     },
     inject() {
       return () => {};
@@ -1006,13 +1007,18 @@ check('apply(): event wiring (created/pre-step/claimed/disposed/tools-change)', 
     sources: { device: { match: ['hdc_*'] } },
     roles: { expert: { mode: 'allow', groups: {}, tools: {} } },
   });
-  for (const name of ['agent/created', 'agent/pre-step', 'agent/disposed', 'agent/inbox/claimed', 'tools/change']) {
+  for (const name of ['agent/created', 'dsh-tool-exposure/before-tool-resolution', 'agent/disposed', 'agent/inbox/claimed', 'tools/change']) {
     ok(typeof handlers[name] === 'function', name + ' wired');
   }
   const agent = makeAgent('expert');
   handlers['agent/created']({ agent });
   eq(agent.ctx.restrictions.length, 1, 'created applies restriction');
-  eq(handlers['agent/pre-step']({ agent }, () => 'next'), 'next', 'pre-step returns next()');
+  agent.ctx.__role = 'open';
+  handlers['dsh-tool-exposure/before-tool-resolution'](agent);
+  eq(agent.ctx.restrictions.length, 0, 'new role applied before resolution');
+  agent.ctx.__role = 'expert';
+  handlers['dsh-tool-exposure/before-tool-resolution'](agent);
+  eq(agent.ctx.restrictions.length, 1, 'switch back reapplies restriction');
   handlers['agent/inbox/claimed']({ agent });
   eq(T.readAgentState(agent, T.STARTED), true, 'claimed marks started');
   handlers['agent/disposed']({ agent });

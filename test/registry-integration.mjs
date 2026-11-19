@@ -9,7 +9,8 @@ import { runProfileSmoke } from './profile-smoke.mjs';
 
 const ownFile = fileURLToPath(import.meta.url);
 const desktopExe = process.env.DSH_NODE_EXECUTABLE || join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness', 'DeepSeek Harness.exe');
-if (process.platform === 'win32' && !process.versions.electron && existsSync(desktopExe)) {
+const useDesktopRuntime = process.env.DSH_NODE_EXECUTABLE || !process.env.DSH_TEST_INSTALL_DIR;
+if (process.platform === 'win32' && !process.versions.electron && useDesktopRuntime && existsSync(desktopExe)) {
   const result = spawnSync(desktopExe, [ownFile], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, encoding: 'utf8', windowsHide: true, timeout: 45000,
   });
@@ -43,9 +44,9 @@ const hook = registerHooks({
 });
 const { Context } = await import(pathToFileURL(installed.resolve('@deepseek-ai/cordis')).href);
 const { ToolsService } = await import(pathToFileURL(toolsEntry).href);
-const { createScope, scopeOf, bindScopeParent } = await import(pathToFileURL(installed.resolve('@deepseek-ai/dsh-scope')).href);
+const { createScope, scopeOf, scopeParentOf, bindScopeParent } = await import(pathToFileURL(installed.resolve('@deepseek-ai/dsh-scope')).href);
 const { default: Registry } = await import('../registry.js');
-const { __test: Host } = await import('../index.js');
+const { apply: applyExposure, __test: Host } = await import('../index.js');
 
 const root = new Context();
 root.provide('systemPrompt', { tools() { return () => {}; } });
@@ -110,10 +111,11 @@ try {
   console.log('PASS registry: distinguishes global, inherited, shadowed, and agent-owned tools');
 
   const currentPresets = new Map([['reviewer', presetA.key], ['other', presetB.key]]);
+  const presetIds = new Map([[presetA.key, 'reviewer'], [presetB.key, 'other']]);
   let activeProbes = 0;
   let probeCalls = 0;
   const presets = {
-    composedPreset: () => 'reviewer',
+    composedPreset: (ctx) => presetIds.get(scopeParentOf(scopeOf(ctx))),
     list: async () => [{ id: 'reviewer', name: 'Reviewer' }, { id: 'other', name: 'Other' }],
     async mount(ctx, id) {
       activeProbes += 1;
@@ -138,6 +140,93 @@ try {
   assert.equal(tools.get('read', agentScope.key), undefined);
   assert.equal(tools.get('late_official', agentScope.key), undefined);
   console.log('PASS registry: official group restrictions cover preset ancestors and survive recomputation');
+
+  const liveAgents = [];
+  root.provide('agents', { list: () => liveAgents });
+  const lifecyclePlugin = { inject: ['tools'], apply: applyExposure };
+  const savedRules = {
+    unlisted: 'closed',
+    roles: { reviewer: { mode: 'allow', groups: { '@plugin/dsh-example-notes': 'on' } }, other: { mode: 'allow' } },
+  };
+  const nextPreset = newScope();
+  presetIds.set(nextPreset.key, 'reviewer');
+  register(nextPreset.ctx, 'dsh-example-notes', 'notes_revise');
+  register(root, 'dsh-example-notes', 'notes_status');
+
+  function openAgent(parent) {
+    const scope = newScope();
+    const agent = Object.assign(scope.key, { ctx: scope.ctx });
+    const binding = parent === undefined ? undefined : bindScopeParent(agent, parent);
+    liveAgents.push(agent);
+    root.emit('agent/created', { agent });
+    return { agent, binding };
+  }
+
+  async function schemaNames(agent) {
+    const toolSet = await tools.resolve({ agent, signal: new AbortController().signal });
+    try {
+      return tools.schemas(agent, toolSet).map(({ name }) => name);
+    } finally {
+      toolSet.dispose();
+    }
+  }
+
+  let lifecycle = root.plugin(lifecyclePlugin, savedRules);
+  try {
+    await lifecycle.inertia;
+    const { agent: switching, binding } = openAgent(presetA.key);
+    assert.ok(tools.executable('notes_status', switching));
+    const revision = tools.catalogRevision;
+    binding.rebind(presetB.key);
+    root.emit('tools/change');
+    await new Promise(setImmediate);
+    assert.equal(tools.catalogRevision, revision, 'rebinding need not register tools');
+    assert.equal(tools.executable('notes_status', switching), undefined);
+
+    const { agent: revising, binding: sameRoleBinding } = openAgent(presetA.key);
+    assert.ok(tools.executable('notes_find', revising));
+    sameRoleBinding.rebind(nextPreset.key);
+    root.emit('tools/change');
+    await new Promise(setImmediate);
+    assert.equal(tools.catalogRevision, revision);
+    assert.ok(tools.executable('notes_revise', revising));
+    assert.equal(tools.executable('notes_find', revising), undefined);
+    console.log('PASS registry: an empty session follows role and preset changes without new registrations');
+
+    const { agent: unbound } = openAgent();
+    assert.equal(tools.executable('notes_status', unbound), undefined, 'closed fallback applies on creation');
+    assert.deepEqual(await schemaNames(unbound), []);
+    bindScopeParent(unbound, presetA.key);
+    const resolved = await schemaNames(unbound);
+    assert.ok(resolved.includes('notes_find'), 'the first resolution after binding uses the role policy');
+    assert.ok(!resolved.includes('same_prefix_calendar'));
+    console.log('PASS registry: default closure and late role binding take effect before tool schemas');
+
+    const { agent: started } = openAgent(presetA.key);
+    root.emit('agent/inbox/claimed', { agent: started });
+    assert.ok(tools.get('notes_find', started));
+    assert.equal(tools.get('same_prefix_calendar', started), undefined);
+
+    await lifecycle.dispose();
+    await new Promise(setImmediate);
+    assert.ok(tools.get('same_prefix_calendar', started), 'policy unload lifts a live session restriction');
+    assert.equal(Host.readAgentState(started, Host.APPLIED), undefined);
+    lifecycle = root.plugin(lifecyclePlugin, { roles: { reviewer: { mode: 'open' } } });
+    await lifecycle.inertia;
+    assert.equal(tools.get('same_prefix_calendar', started), undefined, 'reload restores the saved snapshot');
+    register(root, 'dsh-example-notes', 'notes_list');
+    register(root, '@vendor/calendar', 'calendar_status');
+    assert.equal(tools.get('calendar_status', started), undefined);
+    await new Promise(setImmediate);
+    assert.ok(tools.get('notes_list', started));
+    assert.equal(tools.get('calendar_status', started), undefined);
+
+    const { agent: fresh } = openAgent(presetA.key);
+    assert.ok(tools.get('calendar_status', fresh));
+    console.log('PASS registry: unloading releases restrictions and reloading restores the session snapshot');
+  } finally {
+    await lifecycle.dispose();
+  }
 
   const before = probeCalls;
   const [first, concurrent] = await Promise.all([

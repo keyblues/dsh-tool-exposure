@@ -1,4 +1,4 @@
-![工具暴露 · 按角色管理 DSH 工具可见性](docs/images/readme-cover.png)
+![工具暴露 · 按角色管理 DSH 工具可见性](docs/images/readme-cover.webp)
 
 # 工具暴露 · dsh-tool-exposure
 

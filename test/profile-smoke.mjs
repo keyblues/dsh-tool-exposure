@@ -5,15 +5,56 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createServer } from 'node:net';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { promisify } from 'node:util';
+
+const run = promisify(execFile);
+const packageName = 'dsh-tool-exposure';
+const routePath = `/plugins/${packageName}`;
+const guardHeaders = { 'x-dsh-tool-exposure-plugin': '1' };
+
+function responseCookies(response) {
+  return response.headers.getSetCookie().map((cookie) => cookie.split(';', 1)[0]).join('; ');
+}
+
+async function verifyRouteAuthentication({ origin, launchUrl, headers }) {
+  for (const [method, path] of [['GET', '/inventory'], ['POST', '/save'], ['POST', '/reset'], ['POST', '/debug/apply']]) {
+    const response = await fetch(`${origin}${routePath}${path}`, { method, headers: guardHeaders });
+    assert.equal(response.status, 401, `${method} ${path} requires DSH authentication`);
+  }
+  const crossOrigin = await fetch(`${origin}${routePath}/reset`, {
+    method: 'POST', headers: { ...headers, origin: 'https://other.example' },
+  });
+  assert.equal(crossOrigin.status, 403, 'DSH rejects cross-origin changes even with a browser cookie');
+
+  const connectUrl = new URL('/connect', launchUrl);
+  connectUrl.search = new URL(launchUrl).search;
+  const connection = await fetch(connectUrl, { redirect: 'manual' });
+  const cookie = responseCookies(connection);
+  assert.ok(cookie, 'DSH issued an API peer cookie');
+  const api = await fetch(`${origin}${routePath}/ping`, { headers: { ...guardHeaders, cookie } });
+  assert.equal(api.status, 200, 'authenticated API peers can read diagnostics');
+  for (const path of ['/save', '/reset', '/debug/apply']) {
+    const response = await fetch(`${origin}${routePath}${path}`, { method: 'POST', headers: { ...guardHeaders, cookie } });
+    assert.equal(response.status, 403, `only the authenticated browser peer can call ${path}`);
+  }
+  console.log('PASS profile: DSH authentication protects tool policy reads and browser-only changes');
+}
+
+async function verifyInstalledArchive(profile, archive) {
+  for (const file of ['package.json', 'index.js', 'registry.js']) {
+    const { stdout } = await run('tar', ['-xOf', archive, `package/${file}`], { encoding: 'buffer' });
+    assert.deepEqual(readFileSync(join(profile, 'node_modules', packageName, file)), stdout, `installed ${file} matches the candidate archive`);
+  }
+}
 
 /** Validate real bundle composition, peer resolution, and Loader-sourced tool catalogs. */
 export async function runProfileSmoke(installed, options = {}) {
   let cliManifest;
   try { cliManifest = installed.resolve('@deepseek-ai/dsh/package.json'); }
   catch (error) {
-    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+    if (error.code !== 'MODULE_NOT_FOUND' || options.packageSpec) throw error;
     console.log('SKIP profile smoke: the DSH CLI is not installed with the runtime dependencies.');
     return;
   }
@@ -24,9 +65,71 @@ export async function runProfileSmoke(installed, options = {}) {
   const project = dirname(dirname(fileURLToPath(import.meta.url)));
   const profile = join(taskHome, 'profiles', 'web');
   const fixture = join(taskHome, 'fixture-provider');
+  const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: taskHome };
   let child;
   let closed;
   let logs = '';
+
+  async function install(specifier) {
+    await run(process.execPath, [cliBin, 'plugin', '--profile', 'web', 'add', specifier, '--ignore-scripts'], {
+      cwd: project, env: { ...env, CI: 'true' }, windowsHide: true, timeout: 120000,
+    });
+    const manifest = JSON.parse(readFileSync(join(profile, 'package.json'), 'utf8'));
+    assert.ok(manifest.dsh.profile.bundles.includes(packageName), 'DSH activated the installed bundle');
+  }
+
+  async function startHost() {
+    const probe = createServer();
+    await new Promise((ready, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', ready); });
+    const port = probe.address().port;
+    await new Promise((close) => probe.close(close));
+    const origin = `http://127.0.0.1:${port}`;
+    logs = '';
+    child = spawn(process.execPath, [cliBin, 'web', '--no-open', '--port', String(port)], {
+      cwd: project, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
+    });
+    const collect = (chunk) => { logs = (logs + chunk.toString()).slice(-65536); };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    closed = new Promise((resolveClose) => {
+      child.once('error', (error) => { logs += String(error); resolveClose(); });
+      child.once('close', resolveClose);
+    });
+    const deadline = Date.now() + 20000;
+    let launchUrl;
+    let headers;
+    while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
+      try {
+        launchUrl ??= logs.match(/dsh web: (https?:\/\/\S+)/)?.[1];
+        if (launchUrl && new URL(launchUrl).origin === origin) {
+          if (!headers) {
+            const exchange = await fetch(launchUrl, { redirect: 'manual', signal: AbortSignal.timeout(700) });
+            const cookie = responseCookies(exchange);
+            if (cookie) headers = { ...guardHeaders, cookie };
+          }
+          if (headers) {
+            const response = await fetch(`${origin}${routePath}/inventory`, { headers, signal: AbortSignal.timeout(700) });
+            if (response.ok) {
+              const inventory = await response.json();
+              if (['mcp__fixture__docs__lookup', 'mcp__fixture-archive__lookup'].every((name) =>
+                inventory.globalTools?.some((tool) => tool.name === name))) return { origin, launchUrl, headers, inventory };
+            }
+          }
+        }
+      } catch { /* The owned server is still starting. */ }
+      await delay(200);
+    }
+    assert.fail('isolated DSH startup did not expose authenticated inventory:\n' + logs.slice(-10000).replace(/([?&]token=)[^\s&]+/g, '$1[redacted]'));
+  }
+
+  async function stopHost() {
+    if (!child) return;
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    const stopped = await Promise.race([closed.then(() => true), delay(5000, false)]);
+    assert.ok(stopped, 'isolated DSH did not stop');
+    child = undefined;
+  }
+
   try {
     mkdirSync(join(profile, 'node_modules'), { recursive: true });
     mkdirSync(fixture);
@@ -61,13 +164,17 @@ export function apply(ctx) {
   });
 }
 `);
-    writeFileSync(join(profile, 'package.json'), JSON.stringify({
-      name: 'dsh-tool-exposure-test-profile', private: true,
-      dependencies: { 'dsh-tool-exposure': `link:${project}`, 'dsh-fixture-provider': `link:${fixture}` },
-      dsh: { profile: { bundles: [
-        '@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-fixture-provider', 'dsh-tool-exposure',
-      ] } },
-    }));
+    const { initProfile, readPluginMeta } = await import(pathToFileURL(installed.resolve('@deepseek-ai/dsh-app-boot')).href);
+    const bundles = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-fixture-provider'];
+    const dependencies = { 'dsh-fixture-provider': `link:${fixture}` };
+    if (!options.packageSpec) {
+      bundles.push(packageName);
+      dependencies[packageName] = `link:${project}`;
+    }
+    initProfile(profile, bundles);
+    const manifestPath = join(profile, 'package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    writeFileSync(manifestPath, JSON.stringify({ ...manifest, dependencies }));
     const mcpFixture = join(fixture, 'mcp-server.cjs');
     writeFileSync(mcpFixture, `const readline = require('node:readline');
 const inputSchema = { type: 'object', properties: {} };
@@ -104,10 +211,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       },
       { id: 'mcp-manager', config: { servers: { 'fixture-archive': transport } } },
     ]));
-    symlinkSync(project, join(profile, 'node_modules', 'dsh-tool-exposure'), process.platform === 'win32' ? 'junction' : 'dir');
-    symlinkSync(fixture, join(profile, 'node_modules', 'dsh-fixture-provider'), process.platform === 'win32' ? 'junction' : 'dir');
+    if (options.packageSpec) {
+      await install(options.packageSpec);
+      if (!options.upgradeArchive) await verifyInstalledArchive(profile, options.packageSpec);
+    } else {
+      const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+      symlinkSync(project, join(profile, 'node_modules', packageName), linkType);
+      symlinkSync(fixture, join(profile, 'node_modules', 'dsh-fixture-provider'), linkType);
+    }
 
-    const { readPluginMeta } = await import(pathToFileURL(installed.resolve('@deepseek-ai/dsh-app-boot')).href);
     const metadataBase = pathToFileURL(join(profile, 'package.json')).href;
     for (const [specifier, title] of [['dsh-tool-exposure', '工具暴露'], ['dsh-tool-exposure/registry', '工具来源记录']]) {
       const metadata = readPluginMeta(specifier, metadataBase);
@@ -116,41 +228,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     }
     console.log('PASS metadata: real DSH reads root and registry locales without package warnings');
 
-    const probe = createServer();
-    await new Promise((resolveReady, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolveReady); });
-    const port = probe.address().port;
-    await new Promise((resolveClose) => probe.close(resolveClose));
-    child = spawn(process.execPath, [cliBin, 'web', '--no-open', '--port', String(port)], {
-      cwd: project, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: taskHome },
-    });
-    const collect = (chunk) => { logs = (logs + chunk.toString()).slice(-65536); };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
-    closed = new Promise((resolveClose) => {
-      child.once('error', (error) => { logs += String(error); resolveClose(); });
-      child.once('close', resolveClose);
-    });
-    const origin = `http://127.0.0.1:${port}`;
-    const headers = { 'x-dsh-tool-exposure-plugin': '1' };
-    let inventory;
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      if (child.exitCode !== null) break;
-      try {
-        const response = await fetch(`${origin}/plugins/dsh-tool-exposure/inventory`, { headers, signal: AbortSignal.timeout(700) });
-        if (response.ok) {
-          const snapshot = await response.json();
-          if (['mcp__fixture__docs__lookup', 'mcp__fixture-archive__lookup'].every((name) =>
-            snapshot.globalTools?.some((tool) => tool.name === name))) {
-            inventory = snapshot;
-            break;
-          }
-        }
-      } catch { /* The owned server is still starting. */ }
-      await delay(200);
-    }
-    assert.ok(inventory, 'isolated DSH startup did not expose inventory:\n' + logs.slice(-10000));
+    const running = await startHost();
+    const { origin, launchUrl, headers, inventory } = running;
+    if (!options.upgradeArchive) await verifyRouteAuthentication(running);
     assert.equal(inventory.discovery, true);
     assert.equal(inventory.roles.find((role) => role.id === 'standard').name, undefined);
     assert.equal(inventory.roles.find((role) => role.id === 'review-assistant').name, '评审助手');
@@ -177,27 +257,18 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     assert.ok(standard.every((tool) => tool.name !== 'run_code'));
     assert.ok(standard.every((tool) => tool.provider !== null), 'real Loader registrations retain module identity');
     assert.deepEqual(inventory.diagnostics, []);
-    const effectiveResponse = await fetch(`${origin}/plugins/dsh-tool-exposure/effective?role=standard`, { headers });
+    const effectiveResponse = await fetch(`${origin}${routePath}/effective?role=standard`, { headers });
     const effective = await effectiveResponse.json();
     assert.deepEqual(effective.hidden, []);
     assert.equal(effective.visible.length, standard.length);
     console.log('PASS profile: real DSH boot, peer sharing, official preset tools, and third-party source detection');
     if (options.onReady) {
-      let launchUrl;
-      const launchDeadline = Date.now() + 3000;
-      while (Date.now() < launchDeadline) {
-        launchUrl = logs.match(/dsh web: (https?:\/\/\S+)/)?.[1];
-        if (launchUrl) break;
-        await delay(50);
-      }
-      assert.ok(launchUrl, 'DSH did not announce its authenticated browser URL');
-      assert.equal(new URL(launchUrl).origin, origin);
       await options.onReady({ origin, launchUrl, taskHome, profile });
       return;
     }
 
     const save = async (draft) => {
-      const response = await fetch(`${origin}/plugins/dsh-tool-exposure/save`, {
+      const response = await fetch(`${origin}${routePath}/save`, {
         method: 'POST',
         headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify(draft),
@@ -218,7 +289,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     const rejected = saves[1 - acceptedIndex].body;
     assert.equal(accepted.saved, true);
     assert.equal(rejected.code, 'config_conflict');
-    const latest = await (await fetch(`${origin}/plugins/dsh-tool-exposure/inventory`, { headers })).json();
+    const latest = await (await fetch(`${origin}${routePath}/inventory`, { headers })).json();
     const winner = drafts[acceptedIndex];
     assert.equal(latest.configVersion, accepted.configVersion);
     assert.equal(latest.unlisted, winner.unlisted);
@@ -232,13 +303,29 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 
     const mcpSave = await save({ ...drafts[0], configVersion: restored.body.configVersion });
     assert.equal(mcpSave.status, 200, JSON.stringify(mcpSave));
-    const filtered = await (await fetch(`${origin}/plugins/dsh-tool-exposure/effective?role=standard`, { headers })).json();
+    const filtered = await (await fetch(`${origin}${routePath}/effective?role=standard`, { headers })).json();
     assert.deepEqual(filtered.hidden, ['mcp__fixture__docs__lookup', 'mcp__fixture__docs__status']);
     assert.ok(filtered.visible.includes('mcp__fixture-archive__lookup'));
     console.log('PASS profile: the saved server policy only hides tools from that server');
+
+    if (options.upgradeArchive) {
+      await stopHost();
+      await install(options.upgradeArchive);
+      await verifyInstalledArchive(profile, options.upgradeArchive);
+      const upgraded = await startHost();
+      await verifyRouteAuthentication(upgraded);
+      assert.equal(upgraded.inventory.configVersion, mcpSave.body.configVersion);
+      const response = await fetch(`${upgraded.origin}${routePath}/effective?role=standard`, { headers: upgraded.headers });
+      assert.equal(response.status, 200);
+      const effective = await response.json();
+      assert.deepEqual(effective.hidden, filtered.hidden);
+      assert.deepEqual(effective.visible, filtered.visible);
+      console.log('PASS package upgrade: DSH boots the candidate archive and retains the saved policy');
+    } else if (options.packageSpec) {
+      console.log('PASS package install: a fresh DSH profile boots the candidate archive');
+    }
   } finally {
-    if (child && child.exitCode === null) child.kill();
-    if (closed) await Promise.race([closed, delay(5000)]);
+    await stopHost();
     const target = resolve(taskHome);
     if (dirname(target) !== resolve(tmpdir()) || !basename(target).startsWith('dsh-tool-exposure-profile-')) {
       throw new Error('Refusing to remove an unowned test directory: ' + target);

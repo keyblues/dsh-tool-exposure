@@ -149,7 +149,7 @@ check('host: __test surface covers the tested helpers', () => {
     'liftAllRestrictions',
     'normalizeDraft',
     'resolveRolePolicy',
-    'resyncUnstarted',
+    'refreshAgentPolicies',
   ]) {
     ok(hostSource.includes(key), `__test missing ${key}`);
   }

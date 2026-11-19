@@ -6,14 +6,10 @@
  * 机制（全部基于 DSH 现有 API，不改任何内置插件）：
  *   - discovery 模式管理全局与 ancestor preset 工具，官方工具归为一组；
  *     老配置保留 sources 匹配范围，agent 自身注册的工具不参与限制。
- *   - 角色 = agentPresets.composedPreset(agent.ctx)，即 agent 创建时选中的 preset。
- *   - 对每个新建 agent：解析出该角色应隐藏的受管工具，用 agent.ctx.tools.restrict({ deny })
- *     注册在 agent.ctx.effect() 上 —— 隐藏是「看不见 + 调不到」（UNKNOWN_TOOL），
- *     且与 PTC 模式一致（被隐藏的工具不会生成 SDK 绑定）。
- *   - 快照语义：只在 agent 创建时应用；已有会话保持创建时的工具面（配置保存只影响新会话）。
- *     唯一例外是「尚未开始第一步」的 agent：tools/change 时会重算一次，用于收掉
- *     MCP 等异步晚注册的工具。
- *   - restrict 的硬约束：未知名字 / 空过滤器 / own-scope 名字会抛错。
+ *   - 会话保留创建时的规则，用当前绑定的 preset 和工具目录计算可见性。
+ *   - agent.ctx.tools.restrict() 作用于该会话。限制随会话退出或插件卸载释放。
+ *     自动发现的白名单使用 allow 掩码，覆盖尚未注册的继承工具。
+ *   - restrict 要求提供 allow 或 deny，且不能传未知或本作用域注册的工具名。
  *     这里只下发已注册的继承工具名，并跳过空 deny 列表。
  *
  * Client 半（client.js）在 Settings 里渲染矩阵页，通过本文件注册的同源路由读写：
@@ -22,8 +18,7 @@
  *   GET  {prefix}/effective?role=<preset id>
  *   POST {prefix}/save
  *   POST {prefix}/reset
- * 所有请求必须带 x-dsh-tool-exposure-plugin: 1（插件路由 loopback-open，需自定义头
- * 让跨站页面无法构造简单请求）。
+ * 所有请求使用 DSH 的连接鉴权并携带 x-dsh-tool-exposure-plugin: 1。
  */
 
 import { createHash } from 'node:crypto';
@@ -42,19 +37,9 @@ const GUARD_HEADER = 'x-dsh-tool-exposure-plugin';
 
 /** 每个 agent 对象上的状态槽（Symbol.for 保证跨插件实例/模块重载可复用）。 */
 const APPLIED = Symbol.for('dsh-tool-exposure.applied');
+const POLICY_SNAPSHOT = Symbol.for('dsh-tool-exposure.policy-snapshot');
 const STARTED = Symbol.for('dsh-tool-exposure.started');
 const LEGACY = Symbol.for('dsh-tool-exposure.legacy');
-/**
- * agent/created 时 preset 可能还没挂载完（实测子代理就是这种情况）：此刻
- * composedPreset() 返回 undefined。解析不到角色的 agent 先挂起，等第一次
- * agent/pre-step（preset 已挂载、请求组装之前）再应用。
- */
-const PENDING = Symbol.for('dsh-tool-exposure.pending');
-/** 首次 pre-step 仍解析不到角色时的重试计数（避免永久按 unlisted 静默 fail-open）。 */
-const PENDING_ATTEMPTS = Symbol.for('dsh-tool-exposure.pending-attempts');
-
-/** tools/change 后的重算去抖（毫秒）。 */
-const RESYNC_DEBOUNCE_MS = 120;
 
 /** 保存请求体上限（矩阵配置本身很小，防御异常大包）。 */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -363,7 +348,7 @@ function resolveRolePolicy(config, roleId, index) {
 /* 角色识别与逐 agent 应用                                             */
 /* ------------------------------------------------------------------ */
 
-/** agent 创建时选中的 preset id；无 preset 组合时返回 null（走 unlisted）。 */
+/** 读取会话当前绑定的 preset，未绑定时使用未列出角色的规则。 */
 function roleOfAgent(ctx, agent) {
   const presets = optionalService(ctx, 'agentPresets');
   if (!presets || typeof presets.composedPreset !== 'function') return null;
@@ -375,160 +360,93 @@ function roleOfAgent(ctx, agent) {
   }
 }
 
-/**
- * 对单个 agent 应用（或更新）暴露策略。
- * 快照语义：LEGACY agent（插件加载时已存在的会话）默认不碰，除非 force。
- * 角色解析时机：agent/created 时 preset 可能尚未挂载（实测子代理如此），此时先挂
- * PENDING，由 agent/pre-step 监听器再应用；pre-step 之后仍解析不到就按 unlisted 处理。
- */
+/** 宿主在 agent.ctx 上持有限制，插件也持有同一个限制的清理函数。 */
+function attachRestriction(ctx, agent, tools, filter) {
+  const removeRestriction = tools.restrict(filter);
+  let dispose;
+  try {
+    dispose = ctx.effect(() => () => {
+      if (readAgentState(agent, APPLIED)?.dispose === dispose) setAgentState(agent, APPLIED, undefined);
+      return removeRestriction();
+    }, 'tool-exposure: release agent restriction');
+  } catch (error) {
+    removeRestriction();
+    throw error;
+  }
+  return dispose;
+}
+
+/** 显式 force 使用当前配置替换会话快照。角色和继承工具始终读取当前绑定。 */
 function applyAgentPolicy(ctx, agent, config, options = {}) {
   if (!agent || typeof agent !== 'object') return false;
-  if (options.force !== true && readAgentState(agent, LEGACY) === true) return false;
-  // 用属性访问（agent.ctx.tools）而不是 ctx.get('tools')：服务调用按「调用上下文」定作用域，
-  // 只有通过 agent.ctx 访问才会把 restriction 落到该 agent 的作用域上。
-  const agentCtx = agent.ctx;
-  if (!agentCtx) return false;
-  let tools;
-  try {
-    tools = agentCtx.tools;
-  } catch {
-    return false;
+  const force = options.force === true;
+  if (!force && readAgentState(agent, LEGACY) === true) return false;
+  const existing = force ? undefined : readAgentState(agent, POLICY_SNAPSHOT);
+  const snapshot = existing ?? { config };
+  if (!force && existing === undefined) setAgentState(agent, POLICY_SNAPSHOT, snapshot);
+  const tools = agent.ctx?.tools;
+  if (typeof tools?.restrict !== 'function') {
+    throw new Error('Agent tools service is unavailable');
   }
-  if (!tools || typeof tools.restrict !== 'function') return false;
 
-  const presets = optionalService(ctx, 'agentPresets');
-  const canResolveRole = Boolean(presets && typeof presets.composedPreset === 'function');
-  const roleId = canResolveRole ? roleOfAgent(ctx, agent) : null;
-  if ((canResolveRole === false || roleId === null) && options.allowUnresolved !== true) {
-    // preset 服务还没挂载、或 created 时角色解析不到：挂起，等 pre-step 再试。
-    setAgentState(agent, PENDING, true);
-    return false;
-  }
-  setAgentState(agent, PENDING, false);
-
-  const catalog = toolCatalogOf(tools, config.discovery ? agent : null);
-  if (catalog === null) {
-    // 注册表读取失败：保持当前掩码，不落 APPLIED（tools/change 后还会再试）。
-    return false;
-  }
-  const names = catalog.map((tool) => tool.name);
-  const index = buildToolIndex(config, names, catalog);
-  const policy = resolveRolePolicy(config, roleId, index);
-  const deny = [...policy.hidden].filter((name) => index.registered.has(name) && !RESERVED_TOOL_NAMES.has(name));
-  const signature = `${roleId === null ? '' : roleId}|${deny.join(',')}`;
+  const roleId = roleOfAgent(ctx, agent);
+  const registry = tools.registrations ?? tools;
+  const revision = tools.catalogRevision;
+  const scopeChain = tools.agentToolScopeChain?.(agent);
   const previous = readAgentState(agent, APPLIED);
-  if (previous && previous.signature === signature) return true;
-  if (previous && typeof previous.dispose === 'function') {
+  const sameRegistry = previous?.registry === registry;
+  if (!force && sameRegistry && previous.roleId === roleId && revision !== undefined && previous.revision === revision) {
+    const previousChain = previous.scopeChain;
+    if (scopeChain && previousChain?.length === scopeChain.length && scopeChain.every((key, i) => key === previousChain[i])) return true;
+  }
+
+  const catalog = toolCatalogOf(tools, snapshot.config.discovery ? agent : null);
+  if (catalog === null) throw new Error('Unable to read the agent tool catalog');
+  const names = catalog.map((tool) => tool.name);
+  const index = buildToolIndex(snapshot.config, names, catalog);
+  const policy = resolveRolePolicy(snapshot.config, roleId, index);
+  const deny = [...policy.hidden];
+  // 自动发现覆盖所有继承工具。用 allow 让晚注册的工具在重算前保持隐藏。
+  // 手工分组保留未匹配工具的宿主可见性，继续使用 deny。
+  const allow = snapshot.config.discovery && policy.mode === 'allow' ? [...policy.visible] : undefined;
+  const signature = `${roleId ?? ''}|${allow === undefined ? deny.join(',') : `allow:${allow.join(',')}`}`;
+  let dispose = previous?.dispose ?? null;
+  if (!sameRegistry || previous.signature !== signature) {
+    const filter = allow === undefined ? (deny.length ? { deny } : null) : { allow };
+    // 宿主取各层限制的交集，先安装新限制可以在失败时保留原有保护。
+    dispose = filter ? attachRestriction(ctx, agent, tools, filter) : null;
     try {
-      previous.dispose();
+      previous?.dispose?.();
     } catch {
-      /* 旧的 restriction 已随 agent 作用域消失时忽略 */
+      /* 旧作用域可能已经销毁 */
     }
   }
-  if (deny.length === 0) {
-    setAgentState(agent, APPLIED, { signature, deny: [], dispose: null });
-    return true;
+  setAgentState(agent, APPLIED, { signature, roleId, dispose, registry, revision, scopeChain });
+  if (force) {
+    setAgentState(agent, POLICY_SNAPSHOT, snapshot);
+    setAgentState(agent, LEGACY, false);
   }
-  let dispose = null;
-  let registered = null;
-  try {
-    if (typeof agentCtx.effect === 'function') {
-      // effect 的返回值才是 disposer；个别实现返回 undefined，此时退回 register 的返回值。
-      const returned = agentCtx.effect(() => {
-        registered = agentCtx.tools.restrict({ deny });
-        return registered;
-      }, 'tool-exposure: restrict');
-      dispose = typeof returned === 'function' ? returned : typeof registered === 'function' ? registered : null;
-    } else {
-      registered = agentCtx.tools.restrict({ deny });
-      dispose = registered;
-    }
-  } catch (error) {
-    // effect 可能在 register 之后才抛错：先释放已经注册的那层，避免叠加泄漏。
-    if (typeof registered === 'function') {
-      try {
-        registered();
-      } catch {
-        /* ignore */
-      }
-    }
-    // 未知名字 / own-scope 名字 / 空过滤器都会抛错。此时旧 restriction 已被释放，
-    // 尽量把旧掩码装回去，避免一次失败把 agent 从「已收窄」变成「全开」（fail-open）。
-    console.warn(
-      `${TAG} restrict failed for role ${roleId === null ? '<unlisted>' : roleId}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    let restored = null;
-    if (previous && Array.isArray(previous.deny) && previous.deny.length > 0) {
-      let restoredRegister = null;
-      try {
-        if (typeof agentCtx.effect === 'function') {
-          const returned = agentCtx.effect(() => {
-            restoredRegister = agentCtx.tools.restrict({ deny: previous.deny });
-            return restoredRegister;
-          }, 'tool-exposure: restrict-restore');
-          restored =
-            typeof returned === 'function' ? returned : typeof restoredRegister === 'function' ? restoredRegister : null;
-        } else {
-          restoredRegister = agentCtx.tools.restrict({ deny: previous.deny });
-          restored = restoredRegister;
-        }
-      } catch {
-        if (typeof restoredRegister === 'function') {
-          try {
-            restoredRegister();
-          } catch {
-            /* ignore */
-          }
-        }
-        restored = null;
-      }
-    }
-    setAgentState(agent, APPLIED, {
-      signature: restored === null ? '' : previous.signature,
-      deny: restored === null ? [] : previous.deny,
-      dispose: restored,
-    });
-    return false;
-  }
-  setAgentState(agent, APPLIED, { signature, deny, dispose });
   return true;
 }
 
-/**
- * 第一次 agent/pre-step：preset 此时已挂载，是解析角色并应用策略的最早可靠时机。
- * 该监听器必须透传 next()（waterfall 事件）。
- */
-function applyPendingPolicy(ctx, agent, config) {
-  if (!agent || readAgentState(agent, PENDING) !== true) return;
-  const presets = optionalService(ctx, 'agentPresets');
-  const resolvable = Boolean(presets && typeof presets.composedPreset === 'function');
-  if (resolvable && roleOfAgent(ctx, agent) === null) {
-    // preset 仍未挂载：下一轮 pre-step 再试（最多 3 次），而不是立刻按 unlisted 放开。
-    const attempts = (readAgentState(agent, PENDING_ATTEMPTS) || 0) + 1;
-    setAgentState(agent, PENDING_ATTEMPTS, attempts);
-    if (attempts < 3) return;
-    console.warn(`${TAG} role still unresolved after ${attempts} pre-step(s); applying the unlisted policy`);
-  }
-  setAgentState(agent, PENDING, false);
-  setAgentState(agent, PENDING_ATTEMPTS, 0);
-  applyAgentPolicy(ctx, agent, config, { allowUnresolved: true });
-}
-
-/** 插件加载时把已存在的 agent 标记为 LEGACY：它们保持创建时的工具面。 */
+/** 插件加载时将没有策略快照的现有会话保留为 legacy。 */
 function markLiveAgentsLegacy(ctx) {
   const agents = optionalService(ctx, 'agents');
   const list = agents && typeof agents.list === 'function' ? agents.list() : [];
-  for (const agent of Array.isArray(list) ? list : []) setAgentState(agent, LEGACY, true);
+  for (const agent of Array.isArray(list) ? list : []) {
+    if (readAgentState(agent, POLICY_SNAPSHOT) === undefined) setAgentState(agent, LEGACY, true);
+  }
 }
 
-/** tools/change 后，只重算「尚未开始第一步」的 agent（收掉异步晚注册的工具）。 */
-function resyncUnstarted(ctx, config) {
+/** 工具目录变化后按各会话自己的快照重算。 */
+function refreshAgentPolicies(ctx) {
   const agents = optionalService(ctx, 'agents');
   const list = agents && typeof agents.list === 'function' ? agents.list() : [];
   for (const agent of Array.isArray(list) ? list : []) {
+    const snapshot = readAgentState(agent, POLICY_SNAPSHOT);
+    if (snapshot === undefined) continue;
     try {
-      if (!agent || readAgentState(agent, LEGACY) === true || readAgentState(agent, STARTED) === true) continue;
-      applyAgentPolicy(ctx, agent, config);
+      applyAgentPolicy(ctx, agent, snapshot.config);
     } catch (error) {
       console.warn(`${TAG} resync failed for one agent: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -550,11 +468,10 @@ function liftAllRestrictions(ctx) {
         /* 已随作用域消失 */
       }
     }
-    // 解除后这些会话按快照语义冻结：既不会在 pre-step 被重新应用（PENDING 清掉），
-    // 也不会被 tools/change 重算（标记 LEGACY）。
-    setAgentState(agent, PENDING, false);
+    // 清除会话快照，后续工具注册保留解除状态。
     setAgentState(agent, LEGACY, true);
-    setAgentState(agent, APPLIED, { signature: '', dispose: null });
+    setAgentState(agent, POLICY_SNAPSHOT, undefined);
+    setAgentState(agent, APPLIED, undefined);
   }
   return lifted;
 }
@@ -1041,53 +958,6 @@ function readJsonBody(req) {
   });
 }
 
-/**
- * 同源校验：guard header 不是秘密，DNS rebinding 下攻击页面的 origin 与请求 Host
- * 相同（都指向攻击者域名），浏览器不会拦截自定义头。因此必须校验 Host/Origin 是
- * 本机 webServer 的 origin 或 loopback，挡住 rebinding 驱动的 /save、/reset。
- */
-function isRequestOriginAllowed(ctx, req) {
-  const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
-  if (hostHeader === '') return false;
-  const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim().toLowerCase() : '';
-  const hostnameOf = (value) => value.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
-  const isLoopback = (hostname) => hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
-  const webServer = optionalService(ctx, 'webServer');
-  let expectedOrigin = '';
-  try {
-    if (webServer && typeof webServer.getOrigin === 'function') expectedOrigin = String(webServer.getOrigin()).toLowerCase();
-  } catch {
-    expectedOrigin = '';
-  }
-  if (expectedOrigin !== '') {
-    let expectedHost = '';
-    try {
-      expectedHost = new URL(expectedOrigin).host.toLowerCase();
-    } catch {
-      expectedHost = '';
-    }
-    if (expectedHost !== '' && hostHeader === expectedHost) return originHeader === '' || originHeader === expectedOrigin;
-    // 允许 localhost / 127.0.0.1 互访；Origin（若有）也必须是 loopback。
-    if (isLoopback(hostnameOf(hostHeader))) {
-      if (originHeader === '') return true;
-      try {
-        return isLoopback(hostnameOf(new URL(originHeader).host));
-      } catch {
-        return false;
-      }
-    }
-    return false;
-  }
-  // 服务不支持 getOrigin（尚未 listen）时退化为 loopback 白名单；Origin 若存在也必须 loopback。
-  if (!isLoopback(hostnameOf(hostHeader))) return false;
-  if (originHeader === '') return true;
-  try {
-    return isLoopback(hostnameOf(new URL(originHeader).host));
-  } catch {
-    return false;
-  }
-}
-
 function createRouteHandler(ctx, config) {
   return async function handle(req, res) {
     // Node 会把重复的请求头合并成 "1, 1"，按逗号列表判断，避免误拒。
@@ -1097,19 +967,33 @@ function createRouteHandler(ctx, config) {
       sendJson(res, 403, { ok: false, error: 'forbidden' });
       return;
     }
-    if (!isRequestOriginAllowed(ctx, req)) {
-      sendJson(res, 403, { ok: false, error: 'forbidden' });
-      return;
-    }
-    let url;
     try {
-      url = new URL(req.url ?? '/', 'http://localhost');
-    } catch {
-      sendJson(res, 400, { ok: false, error: 'invalid url' });
-      return;
-    }
-    const sub = url.pathname.startsWith(ROUTE_PREFIX) ? url.pathname.slice(ROUTE_PREFIX.length) : '';
-    try {
+      const connection = optionalService(ctx, 'connection');
+      if (typeof connection?.admit !== 'function') {
+        sendJson(res, 503, { ok: false, error: 'DSH authentication is unavailable' });
+        return;
+      }
+      const admission = connection.admit(req);
+      if ('rejection' in admission) {
+        const status = admission.rejection;
+        sendJson(res, status, { ok: false, error: status === 401 ? 'unauthorized' : 'forbidden' });
+        return;
+      }
+      const peer = admission.peer;
+      // 修改可见性规则是用户操作。API Peer 即使是 owner 也只能读取诊断。
+      if (peer.principal.kind !== 'owner' || (req.method === 'POST' && peer.id !== connection.browserPeer?.id)) {
+        sendJson(res, 403, { ok: false, error: 'forbidden' });
+        return;
+      }
+
+      let url;
+      try {
+        url = new URL(req.url ?? '/', 'http://localhost');
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'invalid url' });
+        return;
+      }
+      const sub = url.pathname.startsWith(`${ROUTE_PREFIX}/`) ? url.pathname.slice(ROUTE_PREFIX.length) : '';
       if (req.method === 'GET' && sub === '/ping') {
         sendJson(res, 200, { ok: true, rowId: ROW_ID, editable: Boolean(optionalService(ctx, 'configEditor')) });
         return;
@@ -1128,15 +1012,17 @@ function createRouteHandler(ctx, config) {
         const list = agents && typeof agents.list === 'function' ? agents.list() : [];
         const rows = [];
         for (const agent of Array.isArray(list) ? list : []) {
+          const snapshot = readAgentState(agent, POLICY_SNAPSHOT);
+          const agentConfig = snapshot?.config ?? config;
           let catalog = [];
           try {
-            catalog = toolCatalogOf(agent.ctx.tools, config.discovery ? agent : null) || [];
+            catalog = toolCatalogOf(agent.ctx.tools, agentConfig.discovery ? agent : null) || [];
           } catch {
             /* The agent scope may already have been disposed. */
           }
-          const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
+          const index = buildToolIndex(agentConfig, catalog.map((tool) => tool.name), catalog);
           const roleId = roleOfAgent(ctx, agent);
-          const policy = resolveRolePolicy(config, roleId, index);
+          const policy = resolveRolePolicy(agentConfig, roleId, index);
           const deny = [...policy.hidden].filter((name) => index.registered.has(name));
           const applied = readAgentState(agent, APPLIED);
           rows.push({
@@ -1148,7 +1034,6 @@ function createRouteHandler(ctx, config) {
             applied: applied ? applied.signature : null,
             started: readAgentState(agent, STARTED) === true,
             legacy: readAgentState(agent, LEGACY) === true,
-            pending: readAgentState(agent, PENDING) === true,
           });
         }
         sendJson(res, 200, { ok: true, agents: rows });
@@ -1162,9 +1047,9 @@ function createRouteHandler(ctx, config) {
         for (const agent of Array.isArray(list) ? list : []) {
           const roleId = roleOfAgent(ctx, agent);
           try {
-            const forced = applyAgentPolicy(ctx, agent, config, { force: true, allowUnresolved: true });
-            // 强制应用后回到常规快照规则：否则这次覆盖永远不会被后续配置代际 reconcile。
-            if (forced) setAgentState(agent, LEGACY, false);
+            if (!applyAgentPolicy(ctx, agent, config, { force: true })) {
+              throw new Error('Agent policy was not applied');
+            }
             const applied = readAgentState(agent, APPLIED);
             results.push({ id: String(agent.id), role: roleId, ok: true, applied: applied ? applied.signature : null });
           } catch (error) {
@@ -1176,7 +1061,7 @@ function createRouteHandler(ctx, config) {
             });
           }
         }
-        sendJson(res, 200, { ok: true, results });
+        sendJson(res, 200, { ok: results.every((result) => result.ok), results });
         return;
       }
       if (req.method === 'POST' && sub === '/save') {
@@ -1213,7 +1098,7 @@ function mountRoutes(ctx, config) {
     registeredFor = webServer;
     try {
       hostCtx.effect(
-        () => webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler: createRouteHandler(hostCtx, config) }),
+        () => webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler: createRouteHandler(ctx, config) }),
         'tool-exposure: routes',
       );
     } catch (error) {
@@ -1232,20 +1117,12 @@ function mountRoutes(ctx, config) {
 /** Cordis 插件名（Loader 诊断用）。 */
 export const name = 'dsh-tool-exposure';
 
-/** 工具注册表是硬依赖；其余服务（agentPresets / agents / configEditor / webServer）按需探测。 */
+/** 工具注册表是硬依赖；预设、会话和 Web 服务按需读取。 */
 export const inject = ['tools'];
 
 /** Cordis 插件入口。 */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig);
-
-  // 插件加载/重载时已存在的 agent：保持它们创建时的工具面（快照语义）。
-  // agents 服务异常不应让整个插件（含设置页路由）加载失败。
-  try {
-    markLiveAgentsLegacy(ctx);
-  } catch (error) {
-    console.warn(`${TAG} markLiveAgentsLegacy failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
 
   ctx.on('agent/created', (payload) => {
     const agent = payload && payload.agent;
@@ -1257,22 +1134,16 @@ export function apply(ctx, rawConfig) {
     }
   });
 
-  // agent/created 时 preset 可能还没挂载：第一次 pre-step 补应用（此时请求尚未组装）。
-  ctx.on('agent/pre-step', (payload, next) => {
-    const agent = payload && payload.agent;
-    if (agent) {
-      try {
-        applyPendingPolicy(ctx, agent, config);
-      } catch (error) {
-        console.warn(`${TAG} apply on agent/pre-step failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    return next();
+  // 工具服务在请求采集工具前同步调用。规则应用失败时由 DSH 终止这一轮请求。
+  ctx.on('dsh-tool-exposure/before-tool-resolution', (agent) => {
+    const snapshot = readAgentState(agent, POLICY_SNAPSHOT);
+    if (snapshot) applyAgentPolicy(ctx, agent, snapshot.config);
   });
 
   ctx.on('agent/disposed', (payload) => {
     const agent = payload && payload.agent;
     const applied = readAgentState(agent, APPLIED);
+    if (agent) AGENT_STATE.delete(agent);
     if (applied && typeof applied.dispose === 'function') {
       try {
         applied.dispose();
@@ -1282,32 +1153,44 @@ export function apply(ctx, rawConfig) {
     }
   });
 
-  // 第一个用户消息被领取 = 该 agent 已经进入工作状态，之后不再重算（快照语义）。
+  // 诊断页展示会话是否已经开始处理消息。
   ctx.on('agent/inbox/claimed', (payload) => {
     const agent = payload && payload.agent;
     if (agent) setAgentState(agent, STARTED, true);
   });
 
-  // 工具集变化（晚注册的 MCP 工具、HMR 等）：只收「还没开始」的 agent。
+  // 宿主先发 tools/change，再由来源记录服务写入元数据。合并同一轮的注册变化，
+  // 并忽略更新限制自身产生的通知。
   ctx.effect(() => {
-    let timer = null;
+    let queued = false;
+    let active = true;
     const off = ctx.on('tools/change', () => {
-      if (timer !== null) clearTimeout(timer);
-      timer = setTimeout(() => {
-        timer = null;
+      if (queued) return;
+      queued = true;
+      queueMicrotask(() => {
+        if (!active) return;
         try {
-          resyncUnstarted(ctx, config);
+          refreshAgentPolicies(ctx);
         } catch (error) {
           console.warn(`${TAG} resync failed: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          queued = false;
         }
-      }, RESYNC_DEBOUNCE_MS);
+      });
     });
     return () => {
+      active = false;
       off();
-      if (timer !== null) clearTimeout(timer);
     };
   }, 'tool-exposure: tools/change resync');
 
+  // 配置热重载后按原快照恢复限制。安装前已存在的会话保留宿主状态。
+  try {
+    markLiveAgentsLegacy(ctx);
+    refreshAgentPolicies(ctx);
+  } catch (error) {
+    console.warn(`${TAG} unable to restore live agent policies: ${error instanceof Error ? error.message : String(error)}`);
+  }
   mountRoutes(ctx, config);
 }
 
@@ -1317,17 +1200,14 @@ export const __test = {
   ROUTE_PREFIX,
   APPLIED,
   LEGACY,
-  PENDING,
   STARTED,
   applyAgentPolicy,
-  applyPendingPolicy,
   buildEffective,
   createRouteHandler,
   buildInventory,
   buildToolIndex,
   globToRegExp,
   globalToolNames,
-  isRequestOriginAllowed,
   liftAllRestrictions,
   listRoles,
   markLiveAgentsLegacy,
@@ -1337,6 +1217,6 @@ export const __test = {
   normalizeConfig,
   normalizeDraft,
   readAgentState,
+  refreshAgentPolicies,
   resolveRolePolicy,
-  resyncUnstarted,
 };
