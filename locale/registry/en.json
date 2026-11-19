@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tool provider tracking",
+    "description": "Extends the official ToolsService to record registering plugins and read preset tool catalogs for Tool Exposure."
+  }
+}

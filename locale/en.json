@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Tool Exposure",
-    "description": "Manage which roles (agent presets) can see the tools registered by third-party plugins, with a role × tool-group matrix."
+    "description": "Manage tool visibility by role from the left sidebar. Roles show names, descriptions and stable IDs; built-in copy follows the DSH language. Group tools by provider with official tools together, search, filter and retain drafts. Saved settings apply to new sessions. Restart DSH after installing or upgrading."
   }
 }

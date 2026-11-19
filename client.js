@@ -1,13 +1,12 @@
 /**
  * dsh-tool-exposure — Client half.
  *
- * Settings →「工具暴露」：按角色（agent preset）管理第三方插件工具的暴露面。
+ * 左侧菜单 →「工具暴露」：独立主页面，按角色管理继承工具与插件分组。
  *
- * 布局沿用 Host 自带设置页的设计语言（参照 ui-settings-general / ui-agent-preset /
- * ui-plugin-manager 的实测样式）：
- *   - 页面：标题 18/600 + 说明 13/tertiary，区块间距 20，行分隔用 .5px border-l2；
- *   - 角色用卡片网格（border .5 settings-card-stroke，radius-xl，选中 bg-module-platform）；
- *   - 开关 36×20、按钮 28/36 高、输入框 32 高，全部走 --dsw-* token。
+ * 布局沿用 Host 的主题 token 与管理页设计语言：
+ *   - 固定页头与操作反馈，独立滚动的角色/工具工作区；
+ *   - 按页面实际可用宽度在双栏、横向角色列表和窄屏控件布局间切换；
+ *   - 工具搜索与可见性筛选只改变展示，策略保持整组与单工具的原有语义。
  *
  * 与 Host 半的契约（必须与 index.js 保持一致）：
  *   GET  /plugins/dsh-tool-exposure/inventory
@@ -26,6 +25,7 @@ window.__ModuleLoader__.load({
 
     /** Locale namespace owned by this plugin. */
     const NS = 'dsh-tool-exposure';
+    const PANEL_ID = 'dsh-tool-exposure';
 
     /** Same-origin Host routes (must stay in sync with ROUTE_PREFIX in index.js). */
     const ROUTE_INVENTORY = '/plugins/dsh-tool-exposure/inventory';
@@ -47,14 +47,34 @@ window.__ModuleLoader__.load({
     const RESCAN_RETRIES = 3;
 
     /** Successful notices fade out on their own. */
-    const NOTICE_TTL_MS = 6000;
+    const NOTICE_TTL_MS = 4000;
 
     const DICT = {
       en: {
-        nav: 'Tool Exposure',
-        title: 'Tool Exposure',
+        nav: 'Tool exposure',
+        title: 'Tool exposure',
         intro:
-          'Choose which tools registered by third-party plugins each role (agent preset) can see. Saving is a snapshot: it applies to sessions created afterwards, while existing sessions keep the tool surface they were created with.',
+          'Manage tool visibility by role. Saved changes apply to new sessions.',
+        back: 'Back to conversation',
+        roleSearch: 'Find a role',
+        roleNoMatch: 'No matching roles.',
+        toolSearch: 'Search tools, plugins or descriptions',
+        filterLabel: 'Tool visibility',
+        filterAll: 'All tools',
+        filterVisible: 'Visible',
+        filterHidden: 'Hidden',
+        clearFilters: 'Clear filters',
+        noMatches: 'No tools match these filters.',
+        matchCount: '{count} matching tools',
+        toolCount: '{count} tools',
+        filterHint: 'Group switches affect the whole group.',
+        expandAll: 'Expand all',
+        collapseAll: 'Collapse all',
+        statVisible: 'Visible tools',
+        statHidden: 'Hidden tools',
+        statGroups: 'Tool groups',
+        advanced: 'Advanced settings',
+        draftKept: 'Your draft is kept when you return to the conversation.',
         loading: 'Loading…',
         loadFailedTitle: 'Could not load the exposure matrix',
         loadFailedHint: 'Make sure the Host half of this bundle is enabled, then retry. Reloading the page also works.',
@@ -68,15 +88,32 @@ window.__ModuleLoader__.load({
         roleReset: 'Use global default',
         roleResetHint: 'Remove this role entry and inherit the global default again.',
         roleEmpty: 'No agent preset was found, so there is no role to configure.',
-        baselineTitle: 'Baseline',
-        baselineDescOpen: 'Open by default: every managed tool is visible unless this role turns it off.',
-        baselineDescAllow: 'Allow-list: no managed tool is visible unless this role turns it on.',
+        roleNoDescription: 'No description.',
+        presetStandardName: 'Standard mode',
+        presetStandardDescription: 'Work with code, files, and information. Suitable for most tasks, with search, editing, terminal commands, and other tools available as needed.',
+        presetPtcName: 'PTC mode',
+        presetPtcDescription: 'All Standard mode capabilities, with programmatic tool calling for batch processing and result analysis.',
+        presetMinimalName: 'Minimal mode',
+        presetMinimalDescription: 'Use terminal commands and image reading with context compaction to test basic capabilities.',
+        presetCordisName: 'Creator mode',
+        presetCordisDescription: 'Customize DSH through plugins, interface changes, tools, and agent presets.',
+        baselineTitle: 'Default rule',
+        baselineDescOpen: 'Tools are visible by default. Turn off individual tools or groups as needed.',
+        baselineDescAllow: 'Tools are hidden by default. Only selected tools and groups are visible.',
         modeOpen: 'Open by default',
         modeAllow: 'Allow-list',
         groupsTitle: 'Tool groups',
+        globalTools: 'Global tools',
+        officialTools: 'Official tools',
+        unknownProvider: 'Unknown provider',
+        providerLabel: 'Provided by {plugin}',
+        mcpServer: 'MCP server',
+        automaticGroup: 'Detected from registrations',
+        noGlobalTools: 'This role has no manageable tools.',
         groupTools: '{count} tools',
         groupPartial: 'partly visible',
         groupNoTools: 'no matching tools',
+        groupEmpty: 'no tools',
         expand: 'Expand',
         collapse: 'Collapse',
         toolVisible: 'visible',
@@ -85,17 +122,19 @@ window.__ModuleLoader__.load({
         ungroupedHint: 'These global tools match no tool group, so this policy never touches them.',
         ungroupedEmpty: 'No ungrouped tool.',
         globalTitle: 'Global',
+        discoveryTitle: 'Group by providing plugin',
+        discoveryHint: 'Discover globally shared and inherited preset tools. Official tools stay together; custom groups can organize other tools.',
         unlistedLabel: 'Roles without their own entry',
         unlistedOpen: 'Unrestricted',
         unlistedClosed: 'No managed tools',
         unlistedHint: 'Applies to roles that have no entry of their own.',
         manageTitle: 'Manage tool groups',
-        manageHint: 'A group matches tools by wildcard (* and ?). First matching group wins.',
+        manageHint: 'Custom groups match tool names with * and ?. They take priority over detected third-party groups; official tools keep their own group. New groups precede a * fallback.',
         manageAdd: 'Add tool group',
-        manageEmpty: 'No tool group yet.',
+        manageEmpty: 'No custom tool groups.',
         manageLabel: 'Label',
         manageMatch: 'Match',
-        manageMatchHint: 'fofa_*, hms_*',
+        manageMatchHint: 'Tool name or wildcard (*)',
         manageId: 'id',
         manageRemove: 'Delete',
         manageAddTitle: 'New tool group',
@@ -113,20 +152,25 @@ window.__ModuleLoader__.load({
         save: 'Save',
         saving: 'Saving…',
         discard: 'Discard',
+        discarded: 'Draft discarded.',
         rescan: 'Rescan',
         rescanning: 'Scanning…',
-        lift: 'Lift live sessions',
+        lift: 'Remove tool restrictions from current sessions',
         lifting: 'Lifting…',
         liftConfirm: 'Lift every restriction this plugin applied to live sessions?',
         liftYes: 'Confirm',
         liftNo: 'Cancel',
         liftDone: 'Lifted the policy on {count} live session(s).',
-        liftDesc: 'Only lifts the masks already applied to live sessions; the saved configuration is unchanged, and those sessions keep their current tool surface.',
+        liftDesc: 'Remove this plugin’s restrictions from all loaded sessions and subagents. Saved settings continue to apply to new sessions.',
         saved: 'Saved; new sessions pick it up.',
         unsaved: 'Unsaved changes',
         saveFailed: 'Save failed: {error}',
         saveFailedShort: 'Save failed',
+        saveConflict: 'The configuration changed elsewhere. Your draft is still here. Rescan to load the latest settings.',
         rescanFailed: 'Rescan failed: {error}',
+        rescanDone: 'Tool list updated.',
+        rescanWaiting: 'Your changes were saved. Waiting for DSH to load them.',
+        dismissNotice: 'Dismiss message',
         rescanDiscard: 'Rescanning discards unsaved changes. Continue?',
         removeGroupConfirm: 'Remove tool group "{label}" from the draft?',
         diagnosticsTitle: 'Warnings',
@@ -141,7 +185,27 @@ window.__ModuleLoader__.load({
         nav: '工具暴露',
         title: '工具暴露',
         intro:
-          '按角色（agent preset）管理第三方插件注册工具的可见面。保存是快照：只对之后新建的会话生效，已有会话保持创建时的工具面。',
+          '按角色管理工具可见性，保存后对新建会话生效。',
+        back: '返回会话',
+        roleSearch: '查找角色',
+        roleNoMatch: '没有匹配的角色。',
+        toolSearch: '搜索工具、插件或描述',
+        filterLabel: '工具可见性',
+        filterAll: '全部工具',
+        filterVisible: '仅可见',
+        filterHidden: '仅隐藏',
+        clearFilters: '清除筛选',
+        noMatches: '没有符合筛选条件的工具。',
+        matchCount: '匹配 {count} 个工具',
+        toolCount: '共 {count} 个工具',
+        filterHint: '整组开关作用于全组',
+        expandAll: '全部展开',
+        collapseAll: '全部收起',
+        statVisible: '可见工具',
+        statHidden: '隐藏工具',
+        statGroups: '工具分组',
+        advanced: '高级设置',
+        draftKept: '返回会话后草稿仍会保留。',
         loading: '加载中…',
         loadFailedTitle: '矩阵数据加载失败',
         loadFailedHint: '请确认本 bundle 的 Host 半已启用后重试，刷新页面也可以。',
@@ -155,15 +219,32 @@ window.__ModuleLoader__.load({
         roleReset: '恢复全局默认',
         roleResetHint: '删除本角色条目，重新继承全局默认。',
         roleEmpty: '没有找到任何 agent preset，暂无可配置的角色。',
-        baselineTitle: '基线',
-        baselineDescOpen: '默认开放：受管工具默认全部可见，本角色只关掉不需要的。',
-        baselineDescAllow: '白名单：受管工具默认全部隐藏，本角色只打开需要的。',
+        roleNoDescription: '暂无说明。',
+        presetStandardName: '标准模式',
+        presetStandardDescription: '处理代码、文件和资料，适合大多数任务。Agent 会按需使用检索、编辑和终端等工具。',
+        presetPtcName: 'PTC 模式',
+        presetPtcDescription: '包含标准模式的所有能力，更适合批量调用工具，并对结果进行筛选、整理、去重、统计或汇总的任务。',
+        presetMinimalName: '极简模式',
+        presetMinimalDescription: 'Agent 使用终端和图片读取工具，并支持上下文压缩，适合测试和对比其基础表现。',
+        presetCordisName: '创造模式',
+        presetCordisDescription: '用对话定制 DSH：让 Agent 编写插件，添加新功能或界面；也能组合工具和提示词，创建自己的模式。',
+        baselineTitle: '默认规则',
+        baselineDescOpen: '工具默认可见，可单独关闭工具或分组。',
+        baselineDescAllow: '工具默认隐藏，只开放你选择的工具或分组。',
         modeOpen: '默认开放',
         modeAllow: '白名单',
         groupsTitle: '工具组',
+        globalTools: '全局工具',
+        officialTools: '官方工具',
+        unknownProvider: '来源未知',
+        providerLabel: '提供插件：{plugin}',
+        mcpServer: 'MCP 服务器',
+        automaticGroup: '根据注册来源自动识别',
+        noGlobalTools: '此角色暂无可管理的工具。',
         groupTools: '{count} 个工具',
         groupPartial: '部分可见',
         groupNoTools: '没有匹配到工具',
+        groupEmpty: '暂无工具',
         expand: '展开',
         collapse: '收起',
         toolVisible: '可见',
@@ -172,17 +253,19 @@ window.__ModuleLoader__.load({
         ungroupedHint: '这些全局工具没有被任何工具组匹配，不受本策略影响。',
         ungroupedEmpty: '没有未归组的工具。',
         globalTitle: '全局',
+        discoveryTitle: '按提供插件自动分组',
+        discoveryHint: '读取全局共享与预设继承工具，官方工具集中为一组；自定义分组可整理其他工具。',
         unlistedLabel: '没有单独配置的角色',
         unlistedOpen: '不限制',
         unlistedClosed: '看不到受管工具',
         unlistedHint: '没有单独条目的角色继承此设置。',
         manageTitle: '管理工具组',
-        manageHint: '工具组用通配符匹配工具名（* 与 ?），按顺序取第一个匹配的组。',
+        manageHint: '自定义组用 * 与 ? 匹配工具名，优先于第三方自动分组；官方工具保留独立分组。新增分组排在 * 兜底组之前。',
         manageAdd: '添加工具组',
-        manageEmpty: '还没有工具组。',
+        manageEmpty: '还没有自定义工具组。',
         manageLabel: '名称',
         manageMatch: '匹配',
-        manageMatchHint: 'fofa_*, hms_*',
+        manageMatchHint: '工具名或通配符（*）',
         manageId: 'id',
         manageRemove: '删除',
         manageAddTitle: '新建工具组',
@@ -200,20 +283,25 @@ window.__ModuleLoader__.load({
         save: '保存',
         saving: '保存中…',
         discard: '放弃修改',
+        discarded: '已放弃未保存的修改。',
         rescan: '重新扫描',
         rescanning: '扫描中…',
-        lift: '解除现有会话策略',
+        lift: '解除所有当前会话的工具限制',
         lifting: '解除中…',
         liftConfirm: '确定解除本插件在所有现有会话上注册的工具限制吗？',
         liftYes: '确认解除',
         liftNo: '取消',
         liftDone: '已解除 {count} 个现有会话上的策略。',
-        liftDesc: '只解除已应用到现有会话上的掩码，不改变保存的配置；这些会话保持当前工具面。',
+        liftDesc: '撤销本插件对所有已加载会话和子代理的工具限制；已保存设置继续用于新建会话。',
         saved: '已保存，新建会话生效。',
         unsaved: '有未保存的修改',
         saveFailed: '保存失败：{error}',
         saveFailedShort: '保存失败',
+        saveConflict: '配置已在别处更新。当前草稿已保留，重新扫描可读取最新配置。',
         rescanFailed: '重新扫描失败：{error}',
+        rescanDone: '工具清单已更新。',
+        rescanWaiting: '修改已保存，正在等 DSH 载入。',
+        dismissNotice: '关闭提示',
         rescanDiscard: '重新扫描会丢弃未保存的修改，继续吗？',
         removeGroupConfirm: '从草稿中删除工具组「{label}」？',
         diagnosticsTitle: '提示',
@@ -260,6 +348,29 @@ window.__ModuleLoader__.load({
     }
 
     let translateFn = fallbackTranslate;
+    let presetTranslateFn = null;
+    let resolvePackageText = null;
+
+    // Same display contract as dsh-agent-preset-registry/display; no private Client imports.
+    const BUILT_IN_PRESET_COPY = new Map([
+      ['standard', 'presetStandard'], ['ptc', 'presetPtc'],
+      ['minimal', 'presetMinimal'], ['cordis', 'presetCordis'],
+    ]);
+
+    function roleDisplayText(role) {
+      const prefix = role.name === undefined ? BUILT_IN_PRESET_COPY.get(role.id) : undefined;
+      const translatePreset = (key) => {
+        try {
+          const value = presetTranslateFn?.(key);
+          if (typeof value === 'string' && value !== '' && value !== key) return value;
+        } catch { /* A custom profile may omit the official preset UI dictionaries. */ }
+        return t(key);
+      };
+      return {
+        displayName: prefix === undefined ? asText(role.name) || role.id : translatePreset(prefix + 'Name'),
+        displayDescription: prefix === undefined ? asText(role.description) : translatePreset(prefix + 'Description'),
+      };
+    }
 
     function t(key) {
       return translateFn(key);
@@ -280,12 +391,35 @@ window.__ModuleLoader__.load({
       return typeof value === 'string' ? value.trim() : '';
     }
 
+    function packageDisplayText(value) {
+      if (!isObject(value)) return asText(value);
+      try {
+        const translated = asText(resolvePackageText?.(value));
+        if (translated) return translated;
+      } catch { /* Older hosts may have no package text resolver. */ }
+      return asText(value[detectLocale()]) || asText(value.en);
+    }
+
+    function groupLabel(id, label) {
+      const value = asText(label);
+      if (id === '@official') return t('officialTools');
+      if (id === '@unknown') return t('unknownProvider');
+      return id === 'global' && value === 'Global tools' ? t('globalTools') : value === '' ? id : value;
+    }
+
     function isObject(value) {
       return value !== null && typeof value === 'object' && !Array.isArray(value);
     }
 
     function errorTextOf(error) {
       return error instanceof Error && error.message !== '' ? error.message : String(error);
+    }
+
+    function saveFailureNotice(error) {
+      const text = error?.code === 'config_conflict'
+        ? t('saveConflict')
+        : fill(t('saveFailed'), { error: errorTextOf(error) });
+      return { tone: 'error', text };
     }
 
     function slugify(text) {
@@ -397,7 +531,9 @@ window.__ModuleLoader__.load({
           isObject(payload) && typeof payload.error === 'string' && payload.error !== ''
             ? payload.error
             : `HTTP ${response.status}`;
-        throw new Error(detail);
+        const error = new Error(detail);
+        if (typeof payload?.code === 'string') error.code = payload.code;
+        throw error;
       }
       if (!isObject(payload)) throw new Error(`HTTP ${response.status}`);
       if (payload.ok === false) {
@@ -447,17 +583,17 @@ window.__ModuleLoader__.load({
           };
         }
       }
-      return { unlisted: payload.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
+      return { discovery: payload.discovery === true, unlisted: payload.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
     }
 
-    function buildLocalIndex(sources, names) {
+    function buildLocalIndex(sources, names, discovery = false, catalog = []) {
       const groups = [];
       for (const id of Object.keys(sources)) {
         const source = sources[id];
         const match = splitMatch(source.match);
         groups.push({
           id,
-          label: asText(source.label) === '' ? id : asText(source.label),
+          label: groupLabel(id, source.label),
           match,
           matchers: match.map(globToRegExp),
           tools: [],
@@ -465,22 +601,46 @@ window.__ModuleLoader__.load({
       }
       const owner = new Map();
       const ungrouped = [];
+      const providers = new Map(catalog.map((tool) => [tool.name, tool.provider || null]));
+      const automatic = new Map();
+      const automaticGroup = (provider, mcpServer) => {
+        const official = provider?.official === true;
+        const known = typeof provider?.plugin === 'string' && provider.plugin !== '';
+        const id = mcpServer ? `@mcp/${mcpServer}` : official ? '@official' : known ? `@plugin/${provider.plugin}` : '@unknown';
+        if (!automatic.has(id)) {
+          const kind = mcpServer ? 'mcp' : official ? 'official' : known ? 'plugin' : 'unknown';
+          automatic.set(id, {
+            id, label: mcpServer || groupLabel(id, known ? provider.plugin : ''), kind, automatic: true,
+            match: [], matchers: [], tools: [],
+          });
+        }
+        return automatic.get(id);
+      };
+      const prioritized = (group) => group.kind === 'official' || group.kind === 'mcp';
       for (const name of names) {
-        let hit = null;
-        for (const group of groups) {
+        const provider = providers.get(name) || null;
+        const server = typeof provider?.mcpServer === 'string' ? provider.mcpServer : '';
+        let hit = discovery && (server || provider?.official === true) ? automaticGroup(provider, server) : null;
+        for (const group of hit === null ? groups : []) {
           if (group.matchers.some((matcher) => matcher.test(name))) {
             hit = group;
             break;
           }
         }
+        if (hit === null && discovery) hit = automaticGroup(provider, server);
         if (hit === null) ungrouped.push(name);
         else {
           hit.tools.push(name);
           owner.set(name, hit.id);
         }
       }
+      const rank = { official: 0, mcp: 1, plugin: 2, unknown: 3 };
+      const discovered = [...automatic.values()].sort((left, right) =>
+        rank[left.kind] - rank[right.kind] || left.label.localeCompare(right.label));
+      groups.unshift(...discovered.filter(prioritized));
+      groups.push(...discovered.filter((group) => !prioritized(group)));
       const managed = names.filter((name) => owner.has(name));
-      return { groups, owner, ungrouped, managed };
+      return { groups, owner, ungrouped, managed, providers, registered: new Set(names) };
     }
 
     function baselineToolVisible(mode, groupValue) {
@@ -532,7 +692,7 @@ window.__ModuleLoader__.load({
         sources[id] = { label: label === '' ? id : label, match: splitMatch(source.match) };
       }
       const roles = {};
-      for (const roleId of Object.keys(draft.roles)) {
+      for (const roleId of Object.keys(draft.roles).sort()) {
         const role = draft.roles[roleId];
         if (!isObject(role) || role.configured !== true) continue;
         roles[roleId] = {
@@ -541,7 +701,14 @@ window.__ModuleLoader__.load({
           tools: copyOverrides(role.tools),
         };
       }
-      return { unlisted: draft.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
+      return { discovery: draft.discovery === true, unlisted: draft.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
+    }
+
+    function matchesSavedConfig(payload, confirmation, nextDraft) {
+      if (confirmation.version !== null && typeof payload.configVersion === 'string') {
+        return payload.configVersion === confirmation.version;
+      }
+      return stableSnapshot(serializeDraft(nextDraft ?? draftFromInventory(payload))) === confirmation.snapshot;
     }
 
     function draftProblemOf(draft) {
@@ -565,10 +732,10 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ */
-    /* 基础控件（按 Host primitives 的实测样式实现）                        */
+    /* 基础控件（对照 DSH 0.2.2-rc.3 的 ui-primitives 源码）                */
     /* ------------------------------------------------------------------ */
 
-    /** 36×20 开关，对应 Host primitives 的 switch。 */
+    /** Host Switch：36×20 轨道、16×16 圆形滑块。 */
     function Switch(props) {
       return h(
         'button',
@@ -591,11 +758,19 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** 二选一分段控件（用于基线模式 / 未配置角色策略）。 */
+    /** Host SegmentedTabs 的 sm 尺寸；此处用于值选择，保留按钮组语义。 */
     function Segmented(props) {
       return h(
         'div',
-        { className: 'tx-seg', role: 'group', 'aria-label': props.ariaLabel },
+        { className: 'tx-seg', role: 'group', 'aria-label': props.ariaLabel,
+          style: { gridTemplateColumns: `repeat(${props.options.length}, minmax(0, 1fr))` } },
+        h('span', {
+          className: 'tx-segIndicator', 'aria-hidden': 'true',
+          style: {
+            width: `calc((100% - 4px) / ${props.options.length})`,
+            transform: `translateX(${Math.max(0, props.options.findIndex((option) => option.value === props.value)) * 100}%)`,
+          },
+        }),
         props.options.map((option) =>
           h(
             'button',
@@ -616,13 +791,26 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function Notice(props) {
-      if (props.notice === null || props.notice === undefined) return null;
-      const tone = props.notice.tone === 'error' ? 'error' : props.notice.tone === 'ok' ? 'ok' : 'info';
+    function Notice({ notice, onDismiss }) {
+      const tone = notice?.tone;
+      const canDismiss = tone === 'error' || tone === 'info';
       return h(
         'div',
-        { className: 'tx-notice', 'data-tone': tone, role: tone === 'error' ? 'alert' : 'status' },
-        props.notice.text,
+        { className: 'tx-feedback' },
+        h('span', { className: 'tx-srOnly', role: 'status', 'aria-atomic': true },
+          tone !== 'error' ? notice?.text : null),
+        notice ? h('div', { className: 'tx-notice', 'data-tone': tone },
+          h(Icon, { kind: tone === 'ok' ? 'check' : tone === 'error' ? 'warning' : 'info' }),
+          h('span', {
+            className: 'tx-noticeText',
+            role: tone === 'error' ? 'alert' : undefined,
+            'aria-hidden': tone === 'error' ? undefined : true,
+          }, notice.text),
+          canDismiss ? h('button', {
+            type: 'button', className: 'tx-noticeDismiss',
+            'aria-label': t('dismissNotice'), title: t('dismissNotice'), onClick: onDismiss,
+          }, h(Icon, { kind: 'close' })) : null,
+        ) : null,
       );
     }
 
@@ -648,23 +836,72 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function ToolExposureIcon() {
+      return h('svg', {
+        className: 'tx-icon', width: 16, height: 16, viewBox: '0 0 24 24',
+        fill: 'none', 'aria-hidden': 'true',
+      },
+      h('path', {
+        d: 'M2.5 12C4.8 8.1 8.2 5.75 12 5.75s7.2 2.35 9.5 6.25c-2.3 3.9-5.7 6.25-9.5 6.25S4.8 15.9 2.5 12Z',
+        stroke: 'currentColor', strokeWidth: 1.75, strokeLinejoin: 'round',
+      }),
+      h('circle', { cx: 12, cy: 12, r: 2.6, fill: 'currentColor' }));
+    }
+
+    function Icon({ kind = 'tools' } = {}) {
+      const paths = {
+        tools: 'M3 4h6v6H3zM15 4h6v6h-6zM3 16h6v5H3zM15 16h6v5h-6zM5 7h2M17 18h2',
+        back: 'm10 6-6 6 6 6M4 12h16',
+        search: 'M10.5 18a7.5 7.5 0 1 0 0-15 7.5 7.5 0 0 0 0 15m5.5-2 5 5',
+        refresh: 'M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 18 17',
+        official: 'M12 3 4 6v6c0 4.5 8 9 8 9s8-4.5 8-9V6l-8-3Zm-4 9 3 3 5-6',
+        check: 'm5 12 4 4L19 6',
+        warning: 'M12 3 2.5 20h19L12 3Zm0 6v4m0 3h.01',
+        info: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-1v5m0-8h.01',
+        close: 'm6 6 12 12M18 6 6 18',
+      };
+      return h('svg', { className: 'tx-icon', width: 16, height: 16, viewBox: '0 0 24 24',
+        fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
+      h('path', { d: paths[kind] || paths.tools }));
+    }
+
+    function pluginImage(src) {
+      if (typeof src !== 'string' || !/^data:image\/(?:svg\+xml|png|jpeg|webp);base64,/.test(src)) return null;
+      return h('img', {
+        className: 'tx-pluginImage', src, alt: '', hidden: true,
+        onLoad: (event) => { event.currentTarget.hidden = false; },
+        onError: (event) => { event.currentTarget.hidden = true; },
+      });
+    }
+
     /* ------------------------------------------------------------------ */
     /* 页面                                                                */
     /* ------------------------------------------------------------------ */
 
-    function ToolExposurePage() {
-      const [phase, setPhase] = React.useState('loading');
-      const [inventory, setInventory] = React.useState(null);
-      const [draft, setDraft] = React.useState(null);
+    function ToolExposurePage(props = {}) {
+      const memory = props.memory;
+      const cached = memory?.snapshot;
+      const restored = cached?.dirty || memory?.pendingSave || memory?.awaitingSnapshot ? cached : null;
+      const [phase, setPhase] = React.useState(restored?.inventory ? 'ready' : 'loading');
+      const [inventory, setInventory] = React.useState(restored?.inventory || null);
+      const [draft, setDraft] = React.useState(restored?.draft || null);
       // 最近一次“已保存/已加载”的草稿快照，用于脏检测与放弃修改。
       // 保存成功后立即更新它：即使随后的重扫失败（Host 热重载窗口），界面也不该同时
       // 显示“已保存”和“有未保存的修改”。
-      const [baseline, setBaseline] = React.useState(null);
-      const [busy, setBusy] = React.useState('');
-      const [notice, setNotice] = React.useState(null);
+      const [baseline, setBaseline] = React.useState(restored?.baseline || null);
+      const [configVersion, setConfigVersion] = React.useState(restored?.configVersion ?? null);
+      const [busy, setBusy] = React.useState(memory?.pendingSave ? 'save' : '');
+      const [notice, setNotice] = React.useState(restored?.notice || null);
       const [errorText, setErrorText] = React.useState('');
-      const [selectedRole, setSelectedRole] = React.useState('');
-      const [expanded, setExpanded] = React.useState({});
+      const [selectedRole, setSelectedRole] = React.useState(cached?.selectedRole || '');
+      const [expanded, setExpanded] = React.useState(cached?.expanded || {});
+      const [filteredExpanded, setFilteredExpanded] = React.useState(cached?.filteredExpanded || {});
+      const [toolQuery, setToolQuery] = React.useState(cached?.toolQuery || '');
+      const [roleQuery, setRoleQuery] = React.useState(cached?.roleQuery || '');
+      const [visibility, setVisibility] = React.useState(cached?.visibility || 'all');
+      const filterActive = toolQuery.trim() !== '' || visibility !== 'all';
+      const shownExpansion = filterActive ? filteredExpanded : expanded;
+      const setShownExpansion = filterActive ? setFilteredExpanded : setExpanded;
       const [manageOpen, setManageOpen] = React.useState(false);
       const [addForm, setAddForm] = React.useState(null);
       const [liftConfirm, setLiftConfirm] = React.useState(false);
@@ -673,7 +910,7 @@ window.__ModuleLoader__.load({
       const mounted = React.useRef(true);
       const seq = React.useRef(0);
       const draftRef = React.useRef(null);
-      const savingRef = React.useRef(false);
+      const savingRef = React.useRef(Boolean(memory?.pendingSave));
       draftRef.current = draft;
 
       React.useEffect(() => {
@@ -684,19 +921,31 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
-      const applyInventory = React.useCallback((payload) => {
+      const applyInventory = React.useCallback((payload, manual = false) => {
         const nextDraft = draftFromInventory(payload);
+        const version = typeof payload.configVersion === 'string' ? payload.configVersion : null;
+        const confirmation = memory?.awaitingSnapshot;
+        if (confirmation) {
+          // 同时保护初次加载、手工扫描和后台回读，旧 Host handler 不能回滚已保存策略。
+          const externalUpdate = manual && version !== null && confirmation.baseVersion !== null
+            && version !== confirmation.baseVersion;
+          if (!externalUpdate && !matchesSavedConfig(payload, confirmation, nextDraft)) return false;
+          memory.awaitingSnapshot = null;
+        }
         const roleIds = (Array.isArray(payload.roles) ? payload.roles : [])
           .filter((role) => isObject(role) && typeof role.id === 'string' && role.id !== '')
           .map((role) => role.id);
         setInventory(payload);
         setDraft(nextDraft);
-        setBaseline(draftFromInventory(payload));
+        setBaseline(nextDraft);
+        setConfigVersion(version);
         setAddForm(null);
+        setRenameForm(null);
         setSelectedRole((current) => (roleIds.includes(current) ? current : roleIds[0] || ''));
         setPhase('ready');
         setErrorText('');
-      }, []);
+        return true;
+      }, [memory]);
 
       const load = React.useCallback(async () => {
         const token = ++seq.current;
@@ -714,10 +963,27 @@ window.__ModuleLoader__.load({
       }, [applyInventory]);
 
       React.useEffect(() => {
-        void load();
+        if (!restored?.inventory) void load();
       }, [load]);
 
-      // 成功提示自动消失；错误保留到下一次操作。
+      React.useEffect(() => {
+        const pending = memory?.pendingSave;
+        if (!pending) return;
+        void pending.then(({ postedDraft, confirmation }) => {
+          if (!mounted.current) return;
+          setBaseline(postedDraft);
+          setConfigVersion(confirmation.version);
+          setNotice({ tone: 'ok', text: t('saved') });
+          void refreshAfterSave(confirmation);
+        }, (error) => {
+          if (mounted.current) setNotice(saveFailureNotice(error));
+        }).finally(() => {
+          savingRef.current = false;
+          if (mounted.current) setBusy('');
+        });
+      }, [memory]);
+
+      // 成功提示自动消失，其他提示可手动关闭。
       React.useEffect(() => {
         if (notice === null || notice.tone !== 'ok') return undefined;
         const timer = setTimeout(() => {
@@ -730,27 +996,35 @@ window.__ModuleLoader__.load({
       // 应答 /inventory。只有服务端快照与刚 POST 的草稿一致时才应用，否则继续重试；
       // 这样不会用旧配置覆盖界面（否则用户下一次保存会把上一次保存抹掉）。
       const refreshAfterSave = React.useCallback(
-        async (postedSnapshot) => {
+        async (confirmation) => {
+          const token = seq.current;
+          const stillCurrent = () => mounted.current && token === seq.current
+            && (!memory || memory.awaitingSnapshot === confirmation);
           for (let attempt = 0; attempt < RESCAN_RETRIES + 1; attempt += 1) {
             await wait(attempt === 0 ? SAVE_RESCAN_DELAY_MS : RESCAN_RETRY_MS);
-            if (!mounted.current) return;
-            const token = ++seq.current;
+            if (!stillCurrent()) return;
             try {
               const payload = await requestJson(ROUTE_INVENTORY);
-              if (!mounted.current || token !== seq.current) return;
-              const serverSnapshot = stableSnapshot(serializeDraft(draftFromInventory(payload)));
-              if (serverSnapshot !== postedSnapshot) continue;
+              if (!stillCurrent()) return;
+              if (!matchesSavedConfig(payload, confirmation)) continue;
+              if (memory) memory.awaitingSnapshot = null;
+              setNotice((current) => current?.kind === 'rescanWaiting' ? null : current);
               // 后台重扫期间用户又改了草稿：不能用服务端状态覆盖。
-              if (draftRef.current === null || stableSnapshot(serializeDraft(draftRef.current)) !== postedSnapshot) return;
+              if (draftRef.current === null || stableSnapshot(serializeDraft(draftRef.current)) !== confirmation.snapshot) return;
               applyInventory(payload);
               return;
             } catch {
-              if (!mounted.current) return;
+              if (!stillCurrent()) return;
             }
           }
         },
-        [applyInventory],
+        [applyInventory, memory],
       );
+
+      React.useEffect(() => {
+        // 保存可能在离开页面后完成。保留已提交策略，直到 Host 确认加载了同一版本。
+        if (memory?.awaitingSnapshot) void refreshAfterSave(memory.awaitingSnapshot);
+      }, [memory, refreshAfterSave]);
 
       /* --------------------------- 草稿修改 --------------------------- */
 
@@ -760,7 +1034,7 @@ window.__ModuleLoader__.load({
           const next = updater(current);
           return isObject(next) ? next : current;
         });
-        setNotice((current) => (current !== null && current.tone === 'error' ? null : current));
+        setNotice((current) => current?.tone === 'info' ? current : null);
       };
 
       const changeUnlisted = (value) => {
@@ -856,7 +1130,7 @@ window.__ModuleLoader__.load({
 
       const removeSource = (id) => {
         const source = draft !== null ? draft.sources[id] : undefined;
-        const label = source !== undefined && asText(source.label) !== '' ? asText(source.label) : id;
+        const label = groupLabel(id, source === undefined ? '' : source.label);
         if (
           typeof window !== 'undefined' &&
           typeof window.confirm === 'function' &&
@@ -867,30 +1141,23 @@ window.__ModuleLoader__.load({
         updateDraft((current) => {
           const sources = { ...current.sources };
           delete sources[id];
-          // 删除工具组后，原本属于它的工具会变成「未归组」；顺手清掉这些工具上的
-          // 单工具例外，避免留下指向未受管工具的死配置（Host 会对此发警告）。
-          const remaining = Object.keys(sources).map((groupId) => ({
-            id: groupId,
-            matchers: splitMatch(sources[groupId].match).map(globToRegExp),
-          }));
-          const groupAfter = (name) => {
-            for (const group of remaining) {
-              if (group.matchers.some((matcher) => matcher.test(name))) return group.id;
-            }
-            return null;
-          };
-          const toolNames = (Array.isArray(inventory && inventory.tools) ? inventory.tools : [])
-            .filter((tool) => isObject(tool) && typeof tool.name === 'string' && tool.name !== '')
-            .map((tool) => tool.name);
+          let detachedTools = [];
+          if (!current.discovery) {
+            const catalog = inventory?.globalTools ?? inventory?.tools;
+            const toolNames = (Array.isArray(catalog) ? catalog : [])
+              .filter((tool) => typeof tool?.name === 'string' && tool.name !== '')
+              .map((tool) => tool.name);
+            const before = buildLocalIndex(current.sources, toolNames);
+            const after = buildLocalIndex(sources, toolNames);
+            detachedTools = before.groups.find((group) => group.id === id)?.tools.filter((name) => !after.owner.has(name)) ?? [];
+          }
           const roles = {};
           for (const roleId of Object.keys(current.roles)) {
             const role = current.roles[roleId];
             const groups = { ...role.groups };
             delete groups[id];
             const tools = { ...role.tools };
-            for (const name of toolNames) {
-              if (groupAfter(name) === null) delete tools[name];
-            }
+            for (const name of detachedTools) delete tools[name];
             roles[roleId] = { ...role, groups, tools };
           }
           return { ...current, sources, roles };
@@ -914,10 +1181,21 @@ window.__ModuleLoader__.load({
           setNotice({ tone: 'error', text: fill(t('manageEmptyMatch'), { label: label === '' ? id : label }) });
           return;
         }
-        updateDraft((current) => ({
-          ...current,
-          sources: { ...current.sources, [id]: { label: label === '' ? id : label, match: match.join(', ') } },
-        }));
+        updateDraft((current) => {
+          const source = { label: label === '' ? id : label, match: match.join(', ') };
+          const sources = {};
+          let inserted = false;
+          for (const [groupId, existing] of Object.entries(current.sources)) {
+            // Preserve first-match semantics while keeping a catch-all from swallowing the new group.
+            if (!inserted && splitMatch(existing.match).includes('*')) {
+              sources[id] = source;
+              inserted = true;
+            }
+            sources[groupId] = existing;
+          }
+          if (!inserted) sources[id] = source;
+          return { ...current, sources };
+        });
         setAddForm(null);
       };
 
@@ -936,37 +1214,34 @@ window.__ModuleLoader__.load({
       };
 
       const toggleExpanded = (groupId) => {
-        setExpanded((current) => {
-          const next = { ...current };
-          if (next[groupId] === true) delete next[groupId];
-          else next[groupId] = true;
-          return next;
-        });
+        setShownExpansion((current) => ({
+          ...current,
+          [groupId]: !(Object.hasOwn(current, groupId) ? current[groupId] : filterActive),
+        }));
       };
 
       /* --------------------------- 派生数据 --------------------------- */
 
+      const groupLocale = [t('officialTools'), t('unknownProvider'), t('globalTools')].join('\0');
       const view = React.useMemo(() => {
         if (inventory === null || draft === null) return null;
-        const tools = (Array.isArray(inventory.tools) ? inventory.tools : []).filter(
+        const validTools = (items) => (Array.isArray(items) ? items : []).filter(
           (tool) => isObject(tool) && typeof tool.name === 'string' && tool.name !== '',
         );
-        const names = tools.map((tool) => tool.name);
-        let index;
-        try {
-          index = buildLocalIndex(draft.sources, names);
-        } catch {
-          // 匹配器异常不应打崩整页：降级为空索引并让用户从管理面板修。
-          index = { groups: [], owner: new Map(), ungrouped: [], managed: [], registered: new Set() };
-        }
+        const tools = validTools(inventory.tools);
+        const globalTools = validTools(Array.isArray(inventory.globalTools) ? inventory.globalTools : inventory.tools);
+        const catalogForRole = (id) => draft.discovery && isObject(inventory.roleTools) && Object.prototype.hasOwnProperty.call(inventory.roleTools, id)
+          ? validTools(inventory.roleTools[id]) : globalTools;
+        const makeIndex = (catalog) => buildLocalIndex(draft.sources, catalog.map((tool) => tool.name), draft.discovery, catalog);
         const fallbackMode = draft.unlisted === 'closed' ? 'allow' : 'open';
-        const roleViews = {};
+        const roleViews = Object.create(null);
         for (const role of Array.isArray(inventory.roles) ? inventory.roles : []) {
           if (!isObject(role) || typeof role.id !== 'string' || role.id === '') continue;
           const stored = draft.roles[role.id];
           const configured = isObject(stored) && stored.configured === true;
           const mode = configured ? (stored.mode === 'allow' ? 'allow' : 'open') : fallbackMode;
           const overrides = configured ? stored : { groups: {}, tools: {} };
+          const index = makeIndex(catalogForRole(role.id));
           const visible = new Set();
           const groupState = {};
           for (const group of index.groups) groupState[group.id] = { visible: 0, total: group.tools.length };
@@ -977,6 +1252,7 @@ window.__ModuleLoader__.load({
             if (groupState[groupId] !== undefined) groupState[groupId].visible += 1;
           }
           roleViews[role.id] = {
+            index,
             mode,
             configured,
             visible,
@@ -985,10 +1261,12 @@ window.__ModuleLoader__.load({
             groupState,
           };
         }
+        const selectedTools = selectedRole === '' ? tools : catalogForRole(selectedRole);
+        const index = roleViews[selectedRole]?.index || makeIndex(selectedTools);
         const descriptions = new Map();
-        for (const tool of tools) descriptions.set(tool.name, typeof tool.description === 'string' ? tool.description : '');
+        for (const tool of selectedTools) descriptions.set(tool.name, typeof tool.description === 'string' ? tool.description : '');
         return { index, roles: roleViews, descriptions };
-      }, [inventory, draft]);
+      }, [inventory, draft, selectedRole, groupLocale]);
 
       const draftSnapshot = React.useMemo(() => (draft === null ? '' : stableSnapshot(draft)), [draft]);
       const baselineSnapshot = React.useMemo(() => (baseline === null ? '' : stableSnapshot(baseline)), [baseline]);
@@ -998,10 +1276,15 @@ window.__ModuleLoader__.load({
       const problems = draft === null ? '' : draftProblemOf(draft);
       const roles = (inventory !== null && Array.isArray(inventory.roles) ? inventory.roles : []).filter(
         (role) => isObject(role) && typeof role.id === 'string' && role.id !== '',
-      );
+      ).map((role) => ({ ...role, ...roleDisplayText(role) }));
       const diagnostics = inventory !== null && Array.isArray(inventory.diagnostics) ? inventory.diagnostics : [];
       const activeRole = selectedRole !== '' ? roles.find((role) => role.id === selectedRole) || null : null;
       const activeView = activeRole !== null && view !== null ? view.roles[activeRole.id] || null : null;
+      if (memory && inventory && draft) {
+        memory.snapshot = {
+          inventory, draft, baseline, configVersion, selectedRole, expanded, filteredExpanded, toolQuery, roleQuery, visibility, dirty, notice,
+        };
+      }
 
       const save = React.useCallback(async () => {
         if (savingRef.current || busy !== '' || draft === null) return;
@@ -1017,27 +1300,43 @@ window.__ModuleLoader__.load({
         savingRef.current = true;
         setBusy('save');
         setNotice(null);
-        try {
-          const payload = await requestJson(ROUTE_SAVE, { method: 'POST', body: JSON.stringify(serializeDraft(draft)) });
-          if (!mounted.current) return;
-          if (payload.saved !== true) {
-            throw new Error(
-              typeof payload.error === 'string' && payload.error !== '' ? payload.error : t('saveFailedShort'),
-            );
+        const postedDraft = JSON.parse(JSON.stringify(draft));
+        const body = serializeDraft(postedDraft);
+        const snapshot = stableSnapshot(body);
+        if (configVersion !== null) body.configVersion = configVersion;
+        const pending = requestJson(ROUTE_SAVE, { method: 'POST', body: JSON.stringify(body) }).then((payload) => {
+          if (payload.saved !== true) throw new Error(typeof payload.error === 'string' && payload.error !== '' ? payload.error : t('saveFailedShort'));
+          const version = typeof payload.configVersion === 'string' ? payload.configVersion : null;
+          const confirmation = { snapshot, version, baseVersion: configVersion };
+          if (memory) memory.awaitingSnapshot = confirmation;
+          if (memory?.snapshot) {
+            memory.snapshot = { ...memory.snapshot, baseline: postedDraft, configVersion: version,
+              dirty: stableSnapshot(memory.snapshot.draft) !== stableSnapshot(postedDraft), notice: { tone: 'ok', text: t('saved') } };
           }
+          return { postedDraft, confirmation };
+        });
+        if (memory) memory.pendingSave = pending;
+        try {
+          const { confirmation } = await pending;
+          if (!mounted.current) return;
           setNotice({ tone: 'ok', text: t('saved') });
           // 配置已写盘：先把当前草稿记为新的基线，再后台重扫（重扫失败也不影响脏状态，
           // 且不长时间锁住整页交互）。
-          setBaseline(JSON.parse(JSON.stringify(draft)));
-          void refreshAfterSave(stableSnapshot(serializeDraft(draft)));
+          setBaseline(postedDraft);
+          setConfigVersion(confirmation.version);
+          void refreshAfterSave(confirmation);
         } catch (error) {
+          const failure = saveFailureNotice(error);
+          if (memory && error?.code === 'config_conflict') memory.awaitingSnapshot = null;
+          if (memory?.snapshot) memory.snapshot.notice = failure;
           if (!mounted.current) return;
-          setNotice({ tone: 'error', text: fill(t('saveFailed'), { error: errorTextOf(error) }) });
+          setNotice(failure);
         } finally {
+          if (memory?.pendingSave === pending) memory.pendingSave = null;
           savingRef.current = false;
           if (mounted.current) setBusy('');
         }
-      }, [busy, draft, editable, problems, dirty, refreshAfterSave]);
+      }, [busy, draft, editable, problems, dirty, configVersion, refreshAfterSave, memory]);
 
       const rescan = React.useCallback(async () => {
         if (busy !== '') return;
@@ -1056,14 +1355,21 @@ window.__ModuleLoader__.load({
         try {
           const payload = await requestJson(ROUTE_INVENTORY);
           if (!mounted.current || token !== seq.current) return;
-          applyInventory(payload);
+          if (applyInventory(payload, true)) {
+            setNotice({ tone: 'ok', text: t('rescanDone') });
+          } else if (memory?.awaitingSnapshot) {
+            setNotice({ tone: 'info', kind: 'rescanWaiting', text: t('rescanWaiting') });
+          }
         } catch (error) {
           if (!mounted.current || token !== seq.current) return;
           setNotice({ tone: 'error', text: fill(t('rescanFailed'), { error: errorTextOf(error) }) });
         } finally {
-          if (mounted.current) setBusy('');
+          if (mounted.current && token === seq.current) {
+            setBusy('');
+            if (memory?.awaitingSnapshot) void refreshAfterSave(memory.awaitingSnapshot);
+          }
         }
-      }, [busy, dirty, applyInventory]);
+      }, [busy, dirty, applyInventory, memory, refreshAfterSave]);
 
       const liftSessions = React.useCallback(async () => {
         if (busy !== '') return;
@@ -1088,8 +1394,9 @@ window.__ModuleLoader__.load({
       const discard = () => {
         if (baseline === null) return;
         setDraft(JSON.parse(JSON.stringify(baseline)));
-        setNotice(null);
+        setNotice({ tone: 'ok', text: t('discarded') });
         setAddForm(null);
+        setRenameForm(null);
       };
 
       // 已配置角色恢复成「继承全局默认」：删掉它自己的条目。
@@ -1104,15 +1411,24 @@ window.__ModuleLoader__.load({
 
       /* ----------------------------- 状态 ----------------------------- */
 
+      const frame = (content, header = null) => h(
+        'section', { className: 'tx-shell', 'aria-label': t('title') },
+        header || h('div', { className: 'tx-topbar' },
+          h('button', { type: 'button', className: 'tx-btn tx-back', onClick: props.onReturn,
+            disabled: typeof props.onReturn !== 'function', title: dirty ? t('draftKept') : t('back') },
+          h(Icon, { kind: 'back' }), t('back')),
+          dirty ? h('span', { className: 'tx-draftHint' }, t('draftKept')) : null,
+        ),
+        h('div', { className: 'tx-page' }, content),
+        h(Notice, { notice, onDismiss: () => setNotice(null) }),
+      );
+
       if (phase === 'loading' && inventory === null) {
-        return h('div', { className: 'tx-page' }, h('p', { className: 'tx-state' }, t('loading')));
+        return frame(h('p', { className: 'tx-state', role: 'status' }, t('loading')));
       }
 
       if (phase === 'error' || inventory === null || draft === null || view === null) {
-        return h(
-          'div',
-          { className: 'tx-page' },
-          h(
+        return frame(h(
             'div',
             { className: 'tx-errorCard' },
             h('div', { className: 'tx-errorTitle' }, t('loadFailedTitle')),
@@ -1123,8 +1439,7 @@ window.__ModuleLoader__.load({
               { type: 'button', className: 'tx-btn tx-btnPrimary', onClick: () => void load() },
               t('retry'),
             ),
-          ),
-        );
+          ));
       }
 
       /* ----------------------------- 渲染 ----------------------------- */
@@ -1146,14 +1461,15 @@ window.__ModuleLoader__.load({
                 ? t('manageDuplicateId')
                 : fill(t('manageEmptyMatch'), { label: asText(addForm.label) === '' ? addId : asText(addForm.label) });
 
-      const roleCards = roles.map((role) => {
-        const roleView = view.roles[role.id] || { mode: 'open', configured: false, visibleList: [], hiddenList: [] };
-        const roleName = asText(role.name) === '' ? role.id : asText(role.name);
+      const visibleRoles = roles.filter((role) => `${role.id} ${role.displayName} ${role.displayDescription}`.toLowerCase().includes(roleQuery.trim().toLowerCase()));
+      const roleCards = visibleRoles.map((role) => {
+        const roleView = view.roles[role.id] || { index: view.index, mode: 'open', configured: false, visibleList: [], hiddenList: [] };
+        const roleName = role.displayName;
         const modeLabel = roleView.mode === 'allow' ? t('modeAllow') : t('modeOpen');
         const meta = fill(t('roleMeta'), {
           mode: modeLabel,
           visible: String(roleView.visibleList.length),
-          managed: String(view.index.managed.length),
+          managed: String(roleView.index.managed.length),
         });
         return h(
           'button',
@@ -1168,18 +1484,72 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: 'tx-roleHead' },
-            h('span', { className: 'tx-roleName' }, roleName),
+            h('span', { className: 'tx-roleName', title: roleName }, roleName),
             role.isDefault === true ? h('span', { className: 'tx-tag' }, t('roleDefault')) : null,
-            roleView.configured ? null : h('span', { className: 'tx-tag tx-tagMuted' }, t('roleUnconfigured')),
             role.broken ? h('span', { className: 'tx-tag tx-tagDanger', title: role.broken }, t('roleBroken')) : null,
           ),
-          h('span', { className: 'tx-roleDesc' }, asText(role.description) !== '' ? asText(role.description) : role.id),
+          h('code', { className: 'tx-roleId', title: role.id }, role.id),
+          h('span', { className: 'tx-roleDesc', title: role.displayDescription || undefined }, role.displayDescription || t('roleNoDescription')),
           h('span', { className: 'tx-roleMeta' }, meta),
         );
       });
 
-      const groupRows = view.index.groups.map((group) => {
-        const isOpen = expanded[group.id] === true;
+      const packageMetadata = (Array.isArray(inventory.providerMetadata) ? inventory.providerMetadata : []).map((item) => ({
+        title: packageDisplayText(item?.title),
+        icon: item?.icon,
+      }));
+      const providers = new Map();
+      for (const [name, identity] of view.index.providers) {
+        if (!identity?.plugin) continue;
+        const bundle = packageMetadata[identity.packageMeta];
+        const module = packageMetadata[identity.moduleMeta];
+        const bundleTitle = bundle?.title && bundle.title !== identity.plugin ? bundle.title : module?.title || identity.plugin;
+        providers.set(name, {
+          ...identity,
+          bundleTitle,
+          bundleIcon: bundle?.icon || module?.icon,
+          title: module?.title || bundleTitle,
+          icon: module?.icon || bundle?.icon,
+        });
+      }
+
+      const query = toolQuery.trim().toLowerCase();
+      const filteredGroups = view.index.groups.map((group) => {
+        const first = providers.get(group.tools[0]);
+        // The official aggregate can contain several providers and has its own artwork.
+        const provider = group.kind !== 'official' && first
+          && group.tools.every((name) => providers.get(name)?.plugin === first.plugin) ? first : null;
+        const label = group.kind === 'plugin' && provider ? provider.bundleTitle : group.label;
+        const groupMatch = label.toLowerCase().includes(query);
+        const matchingTools = group.tools.filter((name) => {
+          const visible = activeView?.visible.has(name) === true;
+          if (visibility === 'visible' && !visible || visibility === 'hidden' && visible) return false;
+          const source = providers.get(name);
+          return groupMatch || [
+            name, view.descriptions.get(name), source?.plugin, source?.module, source?.bundleTitle, source?.title,
+          ].some((text) => typeof text === 'string' && text.toLowerCase().includes(query));
+        });
+        const open = Object.hasOwn(shownExpansion, group.id) ? shownExpansion[group.id] : filterActive;
+        return { ...group, label, provider, matchingTools, open };
+      }).filter((group) => !filterActive || group.matchingTools.length > 0);
+      const matchingCount = filteredGroups.reduce((sum, group) => sum + group.matchingTools.length, 0);
+      const expandableGroups = filteredGroups.filter((group) => group.matchingTools.length > 0);
+      const hasCollapsedGroup = expandableGroups.some((group) => !group.open);
+      const hasOpenGroup = filteredGroups.some((group) => group.open);
+      const hasManageableTools = view.index.managed.length > 0;
+      const groupRows = filteredGroups.map((group) => {
+        const isOpen = group.open;
+        const emptyLabel = group.match.includes('*') ? t('groupEmpty') : t('groupNoTools');
+        let detail;
+        if (group.kind === 'plugin') {
+          detail = group.provider?.plugin === group.label ? '' : group.provider?.plugin;
+        } else if (group.kind === 'mcp') {
+          detail = t('mcpServer');
+        } else if (group.automatic) {
+          detail = t('automaticGroup');
+        } else {
+          detail = [group.provider?.bundleTitle, ...group.match].filter(Boolean).join(' · ');
+        }
         const stats = activeView !== null ? activeView.groupState[group.id] : { visible: 0, total: 0 };
         const state = stats === undefined || stats.total === 0 ? 'none' : stats.visible === 0 ? 'none' : stats.visible === stats.total ? 'all' : 'partial';
         const stateLabel =
@@ -1191,11 +1561,11 @@ window.__ModuleLoader__.load({
                 ? t('groupPartial')
                 : t('toolHidden');
         return h(
-          React.Fragment,
-          { key: group.id },
+          'div',
+          { key: group.id, className: 'tx-toolGroup', 'data-open': isOpen, 'data-kind': group.kind || 'custom' },
           h(
             'div',
-            { className: 'tx-groupRow' },
+            { className: 'tx-groupRow', 'data-kind': group.kind || 'custom' },
             h(
               'button',
               {
@@ -1204,20 +1574,23 @@ window.__ModuleLoader__.load({
                 'aria-expanded': isOpen,
                 onClick: () => toggleExpanded(group.id),
               },
-              h(Chevron, { open: isOpen }),
+              h('span', { className: 'tx-groupIcon', 'aria-hidden': true },
+                h(Icon, { kind: group.kind === 'official' ? 'official' : 'tools' }),
+                pluginImage(group.provider?.bundleIcon)),
               h(
                 'span',
                 { className: 'tx-groupText' },
-                h('span', { className: 'tx-groupName' }, group.label),
+                h('span', { className: 'tx-groupName', title: group.label }, group.label),
                 h(
                   'span',
                   { className: 'tx-groupMeta' },
-                  group.match.length > 0 ? group.match.join(' · ') : '—',
-                  h('span', { className: 'tx-dot' }, '·'),
-                  fill(t('groupTools'), { count: String(group.tools.length) }),
-                  group.tools.length === 0 ? h('span', { className: 'tx-warnInline' }, t('groupNoTools')) : null,
+                  detail ? h('span', { className: 'tx-groupSource', title: detail }, detail) : null,
+                  detail ? h('span', { className: 'tx-dot' }, '·') : null,
+                  h('span', { className: 'tx-groupCount' }, fill(t('groupTools'), { count: String(group.tools.length) })),
+                  group.tools.length === 0 ? h('span', { className: 'tx-sectionMeta' }, emptyLabel) : null,
                 ),
               ),
+              h(Chevron, { open: isOpen }),
             ),
             h(
               'span',
@@ -1227,7 +1600,7 @@ window.__ModuleLoader__.load({
                 checked: state === 'all',
                 mixed: state === 'partial',
                 disabled: locked || activeRole === null || group.tools.length === 0,
-                label: `${group.label} · ${activeRole === null ? '' : asText(activeRole.name) || activeRole.id}`,
+                label: `${group.label} · ${activeRole === null ? '' : activeRole.displayName}`,
                 onChange: () => {
                   if (activeRole !== null) toggleGroup(activeRole.id, group.id, group.tools);
                 },
@@ -1239,9 +1612,10 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'tx-toolList' },
                 group.tools.length === 0
-                  ? h('div', { className: 'tx-toolEmpty' }, t('groupNoTools'))
-                  : group.tools.map((name) =>
-                      h(
+                  ? h('div', { className: 'tx-toolEmpty' }, emptyLabel)
+                  : group.matchingTools.map((name) => {
+                      const provider = providers.get(name);
+                      return h(
                         'div',
                         { key: name, className: 'tx-toolRow' },
                         h(
@@ -1253,6 +1627,14 @@ window.__ModuleLoader__.load({
                             { className: 'tx-toolDesc', title: view.descriptions.get(name) || undefined },
                             view.descriptions.get(name) || '',
                           ),
+                          h(
+                            'span',
+                            { className: 'tx-toolProvider', title: provider?.module || provider?.plugin },
+                            pluginImage(provider?.icon),
+                            h('span', { className: 'tx-toolDesc' }, provider
+                              ? fill(t('providerLabel'), { plugin: provider.title })
+                              : t('unknownProvider')),
+                          ),
                         ),
                         h(Switch, {
                           checked: activeView !== null && activeView.visible.has(name),
@@ -1262,8 +1644,8 @@ window.__ModuleLoader__.load({
                             if (activeRole !== null) toggleTool(activeRole.id, group.id, name);
                           },
                         }),
-                      ),
-                    ),
+                      );
+                    }),
               )
             : null,
         );
@@ -1271,52 +1653,59 @@ window.__ModuleLoader__.load({
 
       const ungrouped = view.index.ungrouped;
 
-      const activeName = activeRole === null ? '' : asText(activeRole.name) === '' ? activeRole.id : asText(activeRole.name);
+      const activeName = activeRole === null ? '' : activeRole.displayName;
       const activeMode = activeView === null ? 'open' : activeView.mode;
+      const headerStatus = busy === 'save' ? t('saving')
+        : busy === 'rescan' ? t('rescanning') : dirty ? t('unsaved') : t('intro');
 
-      return h(
-        'div',
-        { className: 'tx-page' },
-        h(
+      const header = h(
           'header',
           { className: 'tx-head' },
           h(
             'div',
             { className: 'tx-headText' },
             h('h2', { className: 'tx-title' }, t('title')),
-            h('p', { className: 'tx-intro' }, t('intro')),
+            h('p', { className: 'tx-intro', title: headerStatus, 'data-state': dirty && busy === '' ? 'dirty' : undefined }, headerStatus),
           ),
           h(
             'div',
             { className: 'tx-toolbar' },
-            dirty ? h('span', { className: 'tx-unsaved' }, t('unsaved')) : null,
+            h('button', { type: 'button', className: 'tx-btn tx-back', onClick: props.onReturn,
+              disabled: typeof props.onReturn !== 'function', title: dirty ? t('draftKept') : t('back') },
+              h(Icon, { kind: 'back' }), t('back')),
             h(
               'button',
-              { type: 'button', className: 'tx-btn tx-btnSm', disabled: locked, onClick: () => void rescan() },
-              busy === 'rescan' ? t('rescanning') : t('rescan'),
+              {
+                type: 'button', className: 'tx-btn tx-btnOutline', disabled: busy !== '',
+                'aria-busy': busy === 'rescan', onClick: () => void rescan(),
+              },
+              h(Icon, { kind: 'refresh' }),
+              t('rescan'),
             ),
             h(
               'button',
-              { type: 'button', className: 'tx-btn tx-btnSm', disabled: locked || !dirty, onClick: discard },
+              { type: 'button', className: 'tx-btn tx-btnSm', disabled: busy !== '' || !dirty, onClick: discard },
               t('discard'),
             ),
             h(
               'button',
               {
                 type: 'button',
-                className: 'tx-btn tx-btnSm tx-btnPrimary',
-                // 有校验问题时不禁用保存：点击后把问题以提示条显示出来，比一个
+                className: 'tx-btn tx-btnPrimary',
+                // 有校验问题时不禁用保存：点击后显示校验提示，比一个
                 // 只能 hover 才看到原因的禁用按钮更可诊断。
                 disabled: locked || !dirty || !editable,
+                'aria-busy': busy === 'save',
                 title: !editable ? t('readonlyHint') : problems !== '' ? problems : undefined,
                 onClick: () => void save(),
               },
-              busy === 'save' ? t('saving') : t('save'),
+              t('save'),
             ),
           ),
-        ),
+        );
 
-        h(Notice, { notice }),
+      return frame(h(React.Fragment, null,
+
         !editable ? h('p', { className: 'tx-hint' }, t('readonlyHint')) : null,
         diagnostics.length > 0
           ? h(
@@ -1333,50 +1722,69 @@ window.__ModuleLoader__.load({
             )
           : null,
 
+        h('div', { className: 'tx-workspace' },
         // 角色卡片
         h(
           'section',
-          { className: 'tx-section' },
+          { className: 'tx-section tx-rolePanel' },
           h(
             'div',
             { className: 'tx-sectionHead' },
             h('h3', { className: 'tx-sectionTitle' }, t('rolesTitle')),
             h('span', { className: 'tx-sectionMeta' }, `${roles.length}`),
           ),
-          h('p', { className: 'tx-sectionIntro' }, t('rolesIntro')),
-          roles.length === 0
-            ? h('p', { className: 'tx-empty' }, t('roleEmpty'))
+          h('label', { className: 'tx-search' }, h(Icon, { kind: 'search' }),
+            h('input', { type: 'search', value: roleQuery, placeholder: t('roleSearch'), 'aria-label': t('roleSearch'),
+              onChange: (event) => setRoleQuery(event.target.value) })),
+          visibleRoles.length === 0
+            ? h('p', { className: 'tx-empty' }, roles.length === 0 ? t('roleEmpty') : t('roleNoMatch'))
             : h('div', { className: 'tx-roleGrid' }, roleCards),
         ),
 
+        h('div', { className: 'tx-editor' },
         // 选中角色详情
         activeRole === null
           ? h('p', { className: 'tx-hint' }, t('editHint'))
           : h(
               'section',
-              { className: 'tx-section' },
+              { className: 'tx-section tx-policyCard' },
               h(
                 'div',
                 { className: 'tx-detailHead' },
-                h('h3', { className: 'tx-sectionTitle' }, activeName),
+                h('div', { className: 'tx-roleIdentity' },
+                  h('h3', { className: 'tx-sectionTitle', title: activeName }, activeName),
+                  h('code', { className: 'tx-roleId', title: activeRole.id }, activeRole.id)),
                 h(
                   'span',
                   { className: 'tx-detailActions' },
-                  h('span', { className: 'tx-sectionMeta' }, `${activeView.visibleList.length}/${view.index.managed.length}`),
-                  activeView.configured
-                    ? h(
-                        'button',
-                        {
-                          type: 'button',
-                          className: 'tx-btn tx-btnSm',
-                          disabled: locked,
-                          title: t('roleResetHint'),
-                          onClick: () => resetRole(activeRole.id),
-                        },
-                        t('roleReset'),
-                      )
-                    : null,
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'tx-btn tx-btnSm',
+                      'data-unavailable': !activeView.configured || undefined,
+                      disabled: locked || !activeView.configured,
+                      title: t('roleResetHint'),
+                      onClick: () => resetRole(activeRole.id),
+                    },
+                    t('roleReset'),
+                  ),
                 ),
+              ),
+
+              h('p', { className: 'tx-roleSummary', title: activeRole.displayDescription || undefined },
+                activeRole.displayDescription || t('roleNoDescription')),
+
+              h('div', { className: 'tx-stats' },
+                h('div', { className: 'tx-stat', 'data-tone': 'visible' },
+                  h('span', { className: 'tx-statValue' }, String(activeView.visibleList.length)),
+                  h('span', { className: 'tx-statLabel' }, t('statVisible'))),
+                h('div', { className: 'tx-stat', 'data-tone': 'hidden' },
+                  h('span', { className: 'tx-statValue' }, String(activeView.hiddenList.length)),
+                  h('span', { className: 'tx-statLabel' }, t('statHidden'))),
+                h('div', { className: 'tx-stat' },
+                  h('span', { className: 'tx-statValue' }, String(view.index.groups.length)),
+                  h('span', { className: 'tx-statLabel' }, t('statGroups'))),
               ),
 
               // 基线
@@ -1407,7 +1815,43 @@ window.__ModuleLoader__.load({
 
               // 工具组
               h('div', { className: 'tx-subHead' }, t('groupsTitle')),
+              h('div', { className: 'tx-toolControls' },
+                h('label', { className: 'tx-search' }, h(Icon, { kind: 'search' }),
+                  h('input', { type: 'search', value: toolQuery, placeholder: t('toolSearch'), 'aria-label': t('toolSearch'),
+                    onChange: (event) => { setToolQuery(event.target.value); setFilteredExpanded({}); } })),
+                h(Segmented, { value: visibility, ariaLabel: t('filterLabel'), options: [
+                  { value: 'all', label: t('filterAll') },
+                  { value: 'visible', label: t('filterVisible') },
+                  { value: 'hidden', label: t('filterHidden') },
+                ], onChange: (value) => { setVisibility(value); setFilteredExpanded({}); } }),
+                h('div', { className: 'tx-expandActions' },
+                  h('div', { className: 'tx-matchSummary' },
+                    h('span', { className: 'tx-sectionMeta', role: 'status' },
+                      fill(t(filterActive ? 'matchCount' : 'toolCount'), { count: String(matchingCount) })),
+                    filterActive && matchingCount > 0
+                      ? h('details', {
+                          className: 'tx-filterHelp',
+                          onBlur: (event) => {
+                            if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+                          },
+                        },
+                        h('summary', { title: t('filterHint'), 'aria-label': t('filterHint') },
+                          h(Icon, { kind: 'info' }),
+                          h('span', { className: 'tx-filterHint', 'aria-hidden': true }, t('filterHint'))),
+                        h('span', { className: 'tx-filterPopover' }, t('filterHint')))
+                      : null),
+                  h('button', { type: 'button', className: 'tx-btn tx-btnSm', disabled: !hasCollapsedGroup, onClick: () =>
+                    setShownExpansion(Object.fromEntries(expandableGroups.map((group) => [group.id, true]))) }, t('expandAll')),
+                  h('button', { type: 'button', className: 'tx-btn tx-btnSm', disabled: !hasOpenGroup, onClick: () =>
+                    setShownExpansion(Object.fromEntries(filteredGroups.map((group) => [group.id, false]))) }, t('collapseAll'))),
+              ),
+              !hasManageableTools ? h('p', { className: 'tx-empty' }, t('noGlobalTools')) : null,
               h('div', { className: 'tx-groups' }, groupRows),
+              filterActive && hasManageableTools && filteredGroups.length === 0 ? h('div', { className: 'tx-emptyResults' },
+                h(Icon, { kind: 'search' }), h('p', { className: 'tx-empty' }, t('noMatches')),
+                h('button', { type: 'button', className: 'tx-btn tx-btnSm tx-btnOutline', onClick: () => {
+                  setToolQuery(''); setVisibility('all'); setFilteredExpanded({});
+                } }, t('clearFilters'))) : null,
 
               // 最终可见清单
               h(
@@ -1464,7 +1908,7 @@ window.__ModuleLoader__.load({
             ),
 
         // 未归组
-        h(
+        !draft.discovery || ungrouped.length > 0 ? h(
           'section',
           { className: 'tx-section' },
           h(
@@ -1483,13 +1927,29 @@ window.__ModuleLoader__.load({
                   h('li', { key: name, className: 'tx-chip', title: view.descriptions.get(name) || undefined }, name),
                 ),
               ),
-        ),
+        ) : null,
 
+        h('details', { className: 'tx-advanced' },
+          h('summary', { className: 'tx-advancedSummary' }, h(Chevron), t('advanced')),
         // 全局
         h(
           'section',
           { className: 'tx-section' },
           h('div', { className: 'tx-sectionHead' }, h('h3', { className: 'tx-sectionTitle' }, t('globalTitle'))),
+          h(
+            'div',
+            { className: 'tx-row' },
+            h('div', { className: 'tx-rowText' },
+              h('div', { className: 'tx-rowTitle' }, t('discoveryTitle')),
+              h('div', { className: 'tx-rowDesc' }, t('discoveryHint')),
+            ),
+            h(Switch, {
+              checked: draft.discovery,
+              disabled: locked,
+              label: t('discoveryTitle'),
+              onChange: () => updateDraft((current) => ({ ...current, discovery: !current.discovery })),
+            }),
+          ),
           h(
             'div',
             { className: 'tx-row' },
@@ -1576,7 +2036,7 @@ window.__ModuleLoader__.load({
                       h('input', {
                         className: 'tx-input',
                         type: 'text',
-                        value: source.label,
+                        value: groupLabel(id, source.label),
                         spellCheck: false,
                         disabled: locked,
                         placeholder: id,
@@ -1613,7 +2073,7 @@ window.__ModuleLoader__.load({
                           type: 'button',
                           className: 'tx-btn tx-btnSm tx-btnDanger',
                           disabled: locked,
-                          'aria-label': fill(t('manageRemoveLabel'), { label: asText(source.label) === '' ? id : asText(source.label) }),
+                          'aria-label': fill(t('manageRemoveLabel'), { label: groupLabel(id, source.label) }),
                           onClick: () => removeSource(id),
                         },
                         t('manageRemove'),
@@ -1749,35 +2209,118 @@ window.__ModuleLoader__.load({
                 ),
               ),
         ),
-      );
+        ),
+        ),
+        ),
+      ), header);
     }
 
     /* ------------------------------------------------------------------ */
     /* 样式（全部走 --dsw-* token，前缀 tx-）                               */
+    /* 尺寸来源：DSH dsh-v0.2.2-rc.3，PluginManagerPage.module.css、          */
+    /* TaskManagerPage.module.css、ui-primitives/{Button,SegmentedTabs,       */
+    /* Switch,Tag}.module.css。Windows 顶栏的留白由 AppFrame 负责。          */
     /* ------------------------------------------------------------------ */
 
     const CSS = `
-.tx-page{box-sizing:border-box;width:100%;max-width:720px;color:var(--dsw-alias-label-primary);display:flex;flex-direction:column;gap:20px;font-size:13px;line-height:20px}
+.tx-shell{--tx-page-inset:clamp(24px,4vw,48px);--tx-content-width:960px;box-sizing:border-box;position:relative;container:tool-exposure / inline-size;width:100%;height:100%;min-width:0;min-height:0;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);font-size:14px;line-height:22px}
+.tx-topbar{box-sizing:border-box;display:flex;align-items:center;gap:12px;flex:none;width:100%;max-width:calc(var(--tx-content-width) + 2 * var(--tx-page-inset));margin-inline:auto;min-height:40px;padding:10px var(--tx-page-inset) 0}
+.tx-back{color:var(--dsw-alias-label-secondary);margin-inline-start:-8px}
+.tx-draftHint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.tx-feedback {
+  position: absolute;
+  z-index: 2;
+  inset-inline: 16px;
+  inset-block-end: max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.tx-srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.tx-page{box-sizing:border-box;width:100%;min-width:0;min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:32px var(--tx-page-inset) 48px;display:flex;flex-direction:column;align-items:center;gap:32px}
+.tx-page>*{flex:none;width:100%;max-width:var(--tx-content-width)}
+.tx-workspace{display:grid;grid-template-columns:224px minmax(0,1fr);gap:40px;align-items:start;width:100%;min-width:0}
+.tx-rolePanel{position:sticky;top:0;box-sizing:border-box;max-height:calc(100dvh - 200px);overflow:hidden;gap:16px;padding:0}
+.tx-editor{display:flex;flex-direction:column;gap:32px;min-width:0}
+.tx-policyCard{box-sizing:border-box;padding:0;gap:16px}
+.tx-icon{flex:none;display:block}
+.tx-search{box-sizing:border-box;display:flex;flex:none;align-items:center;gap:8px;min-width:0;height:36px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:12px;background:transparent;color:var(--dsw-alias-label-tertiary);transition:border-color .15s}
+.tx-search:focus-within{border-color:var(--dsw-alias-state-business-primary)}
+.tx-search>.tx-icon{width:14px;height:14px}
+.tx-search input{font:inherit;font-size:14px;line-height:22px;min-width:0;width:100%;height:100%;padding:0;border:0;outline:none;background:transparent;color:var(--dsw-alias-label-primary)}
+.tx-search input::placeholder{color:var(--dsw-alias-label-caption)}
+.tx-stats{display:flex;flex-wrap:wrap;align-items:center;gap:8px 24px}
+.tx-stat{display:flex;align-items:baseline;gap:6px;min-width:0}
+.tx-statValue{font-size:13px;font-weight:500;line-height:20px;font-variant-numeric:tabular-nums}
+.tx-statLabel{font-size:12px;color:var(--dsw-alias-label-tertiary)}
+.tx-toolControls{display:grid;grid-template-columns:minmax(160px,1fr) auto;gap:10px;align-items:center}
+.tx-expandActions{position:relative;grid-column:1/-1;display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.tx-matchSummary{display:flex;align-items:center;gap:10px;flex:1 1 8rem;min-width:0;white-space:nowrap}
+.tx-matchSummary>.tx-sectionMeta{flex:none}
+.tx-filterHelp{min-width:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.tx-filterHelp>summary{display:flex;align-items:center;gap:4px;min-height:24px;padding-inline:4px;border-radius:var(--dsw-radius-sm);list-style:none;cursor:pointer}
+.tx-filterHelp>summary::-webkit-details-marker{display:none}
+.tx-filterHelp>summary:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.tx-filterHelp>summary>.tx-icon{width:14px;height:14px}
+.tx-filterHint{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tx-filterPopover{position:absolute;z-index:1;inset-inline-start:0;inset-block-start:100%;box-sizing:border-box;max-width:100%;padding:6px 10px;border-radius:var(--dsw-radius-md);white-space:normal;color:var(--dsw-alias-toast-label);background:var(--dsw-alias-toast-bg);box-shadow:var(--dsw-shadow-lv3);pointer-events:none}
+.tx-emptyResults{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;min-height:140px;padding:20px;color:var(--dsw-alias-label-tertiary)}
+.tx-advanced{border-top:.5px solid var(--dsw-alias-border-l2);padding:0}
+.tx-advancedSummary{display:flex;align-items:center;gap:8px;list-style:none;cursor:pointer;padding:20px 0;font-size:14px;font-weight:500}
+.tx-advancedSummary::marker{content:''}
+.tx-advanced[open]>.tx-advancedSummary{margin-bottom:4px}
+.tx-advanced[open]>.tx-advancedSummary .tx-chevron{transform:rotate(90deg)}
+.tx-advanced>.tx-section{margin-bottom:18px}
 .tx-state{color:var(--dsw-alias-label-tertiary);margin:0;padding:24px 0}
-.tx-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.tx-head{box-sizing:border-box;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:16px;flex:none;width:100%;max-width:calc(var(--tx-content-width) + 2 * var(--tx-page-inset));margin-inline:auto;padding:28px var(--tx-page-inset) 0}
 .tx-headText{min-width:0;display:flex;flex-direction:column;gap:4px}
-.tx-title{margin:0;font-size:18px;font-weight:600;line-height:26px}
-.tx-intro{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
-.tx-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-.tx-unsaved{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-state-warn-primary));font-size:12px;line-height:18px}
+.tx-title{margin:0;font-size:20px;font-weight:500;line-height:28px}
+.tx-intro{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-intro[data-state=dirty]{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-state-warn-primary))}
+.tx-toolbar{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;justify-content:flex-end;min-width:0;white-space:nowrap}
 .tx-btn{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:32px;padding:0 12px;border:none;border-radius:var(--dsw-radius-md);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:20px;cursor:pointer}
-.tx-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.tx-toolbar .tx-btn>.tx-icon{width:13px;height:13px}
+.tx-toolbar .tx-btn[aria-busy=true]>.tx-icon{animation:tx-spin .85s linear infinite}
 .tx-btn:active:not(:disabled){background:var(--dsw-alias-interactive-bg-active)}
 .tx-btn:disabled{opacity:.4;cursor:not-allowed}
-.tx-btn:focus-visible,.tx-segBtn:focus-visible,.tx-switch:focus-visible,.tx-roleCard:focus-visible,.tx-groupMain:focus-visible,.tx-disclosure:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.tx-btn:focus-visible,.tx-segBtn:focus-visible,.tx-switch:focus-visible,.tx-roleCard:focus-visible,.tx-groupMain:focus-visible,.tx-disclosure:focus-visible,.tx-advancedSummary:focus-visible,.tx-noticeDismiss:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
 .tx-btnSm{height:28px;padding:0 10px;font-size:12px;line-height:18px;border-radius:var(--dsw-radius-sm)}
 .tx-btnPrimary{background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
-.tx-btnPrimary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}
-.tx-btnOutline{border:.5px solid var(--dsw-alias-border-l3)}
+.tx-btnOutline{border:.5px solid transparent;box-shadow:inset 0 0 0 var(--dsh-hairline-width,.5px) var(--dsh-button-outline-color,var(--dsw-alias-border-l3))}
 .tx-btnDanger{color:var(--dsw-alias-state-error-primary)}
-.tx-notice{margin:0;padding:8px 12px;border-radius:var(--dsw-radius-md);font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);border:.5px solid var(--dsw-alias-border-l2)}
-.tx-notice[data-tone=ok]{color:var(--dsw-alias-state-success-primary);border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 30%, transparent);background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 8%, transparent)}
-.tx-notice[data-tone=error]{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 30%, transparent);background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent)}
+.tx-notice {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: min(100%, 28rem);
+  padding: 8px 12px;
+  border-radius: var(--dsw-radius-lg);
+  color: var(--dsw-alias-toast-label);
+  background: var(--dsw-alias-toast-bg);
+  box-shadow: var(--dsw-shadow-lv3);
+  font-size: 13px;
+  line-height: 20px;
+  animation: tx-notice-in 150ms ease-out;
+}
+.tx-notice>.tx-icon{width:16px;height:16px}
+.tx-notice[data-tone=ok]>.tx-icon{color:var(--dsw-alias-state-success-primary)}
+.tx-notice[data-tone=error]>.tx-icon{color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 55%,currentColor)}
+.tx-noticeText{min-width:0;overflow-wrap:anywhere;max-height:min(8rem,30dvh);overflow:auto}
+.tx-notice[data-tone=error]>.tx-noticeText{pointer-events:auto}
+.tx-noticeDismiss{display:grid;place-items:center;flex:none;width:24px;height:24px;padding:0;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:inherit;cursor:pointer;pointer-events:auto}
+.tx-noticeDismiss:hover{background:color-mix(in srgb,currentColor 16%,transparent)}
+.tx-noticeDismiss>.tx-icon{width:14px;height:14px}
+@keyframes tx-notice-in{from{opacity:0;transform:translateY(4px)}}
+@keyframes tx-spin{to{transform:rotate(1turn)}}
 .tx-hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .tx-empty{margin:0;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px}
 .tx-warnCard{border-radius:var(--dsw-radius-md);background:var(--dsw-alias-state-warn-tertiary);padding:10px 12px;display:flex;flex-direction:column;gap:4px}
@@ -1790,72 +2333,103 @@ window.__ModuleLoader__.load({
 .tx-sectionMeta{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .tx-sectionIntro{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .tx-detailHead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.tx-roleIdentity{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
+.tx-roleIdentity>.tx-sectionTitle{font-size:14px;line-height:20px}
+.tx-roleSummary,.tx-roleDesc{color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-roleSummary{margin:-8px 0 0}
+.tx-roleId{font-family:var(--ds-font-family-code,ui-monospace,Consolas,monospace);font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
 .tx-detailActions{display:flex;align-items:center;gap:8px;flex:none}
-.tx-subHead{color:var(--dsw-alias-label-tertiary);font-size:12px;font-weight:600;line-height:18px;letter-spacing:.04em;text-transform:uppercase;margin-top:2px}
-.tx-roleGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px}
-.tx-roleCard{appearance:none;font:inherit;text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px 14px;border:.5px solid var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l2));border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-settings-card-fill,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-label-primary);transition:border-color .16s,background .16s}
-.tx-roleCard:hover:not([data-active=true]){background:var(--dsw-alias-interactive-bg-hover)}
-.tx-roleCard[data-active=true]{background:var(--dsw-alias-bg-module-platform,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-static-neutral-bluish-400,var(--dsw-alias-brand-primary))}
+.tx-detailActions>[data-unavailable=true]{visibility:hidden}
+.tx-subHead{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:22px;margin-top:8px}
+.tx-roleGrid {
+  /* Keep an 8px drag target around a 4px visible thumb. */
+  --dsh-scrollbar-width: 8px;
+  --dsh-scrollbar-thumb-border: 2px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  min-height: 0;
+  overflow: auto;
+  padding: 2px;
+}
+@media (hover: hover) and (pointer: fine) and (forced-colors: none) {
+  .tx-roleGrid:not(:hover):not(:has(:focus-visible)) {
+    --dsh-scrollbar-thumb: transparent;
+  }
+}
+.tx-roleCard{appearance:none;font:inherit;text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:5px;min-width:0;padding:12px;border:0;border-radius:var(--dsw-radius-lg,10px);background:transparent;color:var(--dsw-alias-label-primary)}
+.tx-roleCard[data-active=true]{background:var(--dsw-alias-bg-module-platform,var(--dsw-alias-bg-layer-2))}
 .tx-roleHead{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
-.tx-roleName{font-size:15px;font-weight:600;line-height:22px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.tx-roleDesc{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-roleName{font-size:14px;font-weight:500;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .tx-roleMeta{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin-top:2px}
-.tx-tag{flex:none;border-radius:999px;background:var(--dsw-alias-fill-tsp-secondary,var(--dsw-alias-bg-layer-3));color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px;padding:0 7px}
-.tx-tagMuted{background:transparent;border:.5px solid var(--dsw-alias-border-l2)}
+.tx-tag{display:inline-flex;align-items:center;flex:none;border-radius:999px;corner-shape:round;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:500;line-height:17px;padding:1px 8px;white-space:nowrap}
 .tx-tagDanger{background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary))}
-.tx-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:14px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.tx-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:20px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
 .tx-rowText{min-width:0;display:flex;flex-direction:column;gap:4px}
 .tx-rowTitle{font-size:14px;line-height:20px}
 .tx-rowDesc{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .tx-rowActions{display:flex;align-items:center;gap:8px;flex:none}
-.tx-seg{display:inline-flex;align-items:center;gap:2px;padding:2px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);flex:none}
-.tx-segBtn{appearance:none;font:inherit;font-size:12px;line-height:18px;height:24px;padding:0 10px;border:none;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;white-space:nowrap}
-.tx-segBtn:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
-.tx-segBtn[data-active=true]{background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);box-shadow:var(--dsw-elevation-soft,none)}
+.tx-seg{position:relative;display:grid;padding:2px;border:0;border-radius:calc(var(--dsw-radius-md) + 2px);background:var(--dsw-alias-bg-module-platform);flex:none;min-width:0}
+.tx-segIndicator{position:absolute;inset:2px auto 2px 2px;box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-3);transition:transform 180ms ease;pointer-events:none}
+.tx-segBtn{appearance:none;position:relative;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;font:inherit;font-size:14px;font-weight:400;line-height:20px;height:30px;padding:0 12px;border:0;border-radius:var(--dsw-radius-md);background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap;transition:color 180ms ease}
+.tx-segBtn[data-active=true]{color:var(--dsw-alias-label-primary);font-weight:500}
 .tx-segBtn:disabled{opacity:.5;cursor:default}
-.tx-groups{border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-bg-layer-1);overflow:hidden}
-.tx-groupRow{display:flex;align-items:center;gap:12px;padding:0 12px 0 4px;border-bottom:.5px solid var(--dsw-alias-border-l2)}
-.tx-groupRow:last-child{border-bottom:none}
-.tx-groupMain{appearance:none;font:inherit;text-align:left;cursor:pointer;display:flex;align-items:center;gap:8px;min-width:0;flex:1;padding:12px 8px;background:transparent;border:none;color:var(--dsw-alias-label-primary);border-radius:var(--dsw-radius-sm)}
-.tx-groupMain:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.tx-groups{display:flex;flex-direction:column;gap:2px;min-width:0}
+.tx-toolGroup{min-width:0}
+.tx-groupRow{display:flex;align-items:center;gap:12px;padding:0 8px;margin-inline:-8px;min-width:0;border-radius:var(--dsw-radius-xl)}
+.tx-groupIcon{display:grid;place-items:center;flex:none;box-sizing:content-box;width:48px;height:48px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-lg);color:var(--dsw-alias-label-secondary)}
+.tx-groupIcon>.tx-icon{width:22px;height:22px}
+.tx-pluginImage{display:block;object-fit:contain;border-radius:var(--dsw-radius-sm)}
+.tx-pluginImage[hidden]{display:none}
+.tx-groupIcon>.tx-icon,.tx-groupIcon>.tx-pluginImage{grid-area:1/1}
+.tx-groupIcon>.tx-pluginImage{width:75%;height:75%}
+.tx-groupIcon:has(>.tx-pluginImage:not([hidden]))>.tx-icon{visibility:hidden}
+.tx-toolGroup[data-kind=official] .tx-groupIcon{color:var(--dsw-alias-state-business-primary)}
+.tx-groupMain{appearance:none;font:inherit;text-align:left;cursor:pointer;display:flex;align-items:center;gap:14px;min-width:0;flex:1;padding:8px 0;background:transparent;border:none;color:var(--dsw-alias-label-primary);border-radius:var(--dsw-radius-sm)}
 .tx-chevron{flex:none;color:var(--dsw-alias-label-tertiary);transition:transform .16s}
 .tx-chevron[data-open=true]{transform:rotate(90deg)}
-.tx-groupText{display:flex;flex-direction:column;gap:2px;min-width:0}
+.tx-groupText{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}
 .tx-groupName{font-size:14px;line-height:20px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tx-groupMeta{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-groupMeta{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:18px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-groupSource{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tx-groupCount,.tx-dot{flex:none}
 .tx-dot{opacity:.6}
 .tx-warnInline{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-state-warn-primary))}
 .tx-groupEnd{display:flex;align-items:center;gap:10px;flex:none}
 .tx-groupState{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;white-space:nowrap}
 .tx-groupState[data-state=partial]{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-state-warn-primary))}
 .tx-groupState[data-state=all]{color:var(--dsw-alias-label-secondary)}
-.tx-toolList{display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-2);border-bottom:.5px solid var(--dsw-alias-border-l2)}
-.tx-toolRow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 12px 8px 28px;border-top:.5px solid var(--dsw-alias-border-l1)}
+.tx-toolList{display:flex;flex-direction:column;margin:0 0 8px 63px}
+.tx-toolRow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-top:.5px solid var(--dsw-alias-border-l2)}
 .tx-toolRow:first-child{border-top:none}
 .tx-toolText{display:flex;flex-direction:column;gap:1px;min-width:0}
-.tx-toolName{font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tx-toolDesc{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tx-toolEmpty{padding:10px 12px 10px 28px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-.tx-switch{box-sizing:border-box;position:relative;flex:none;width:36px;height:20px;padding:2px;border:0;border-radius:999px;background:var(--dsw-alias-state-idle-primary,var(--dsw-alias-border-l3));cursor:pointer}
+.tx-toolName{font-family:var(--ds-font-family-code);font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.tx-toolDesc{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.tx-toolProvider{display:flex;align-items:center;gap:5px;min-width:0}
+.tx-toolProvider>.tx-pluginImage{width:14px;height:14px;flex:none;border-radius:3px}
+.tx-toolProvider>.tx-toolDesc{display:block;white-space:nowrap;text-overflow:ellipsis}
+.tx-toolEmpty{padding:10px 0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.tx-switch{box-sizing:border-box;position:relative;flex:0 0 auto;width:36px;height:20px;padding:2px;border:0;border-radius:999px;corner-shape:round;background:var(--dsw-alias-border-l3);cursor:pointer}
 .tx-switch[aria-checked=true]{background:var(--dsw-alias-brand-primary)}
 .tx-switch[data-mixed=true]{background:var(--dsw-alias-state-warn-primary)}
 .tx-switch:disabled{cursor:default;opacity:.5}
-.tx-switchThumb{display:block;width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-switch-thumb,var(--dsw-alias-label-primary-foreground));box-shadow:0 1px 2px var(--dsw-alias-border-l2);transition:transform .16s}
+.tx-switchThumb{display:block;width:16px;height:16px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-label-primary-foreground);transition:transform 120ms ease}
+.tx-switch[aria-checked=false] .tx-switchThumb{background:var(--dsw-alias-switch-thumb)}
 .tx-switch[aria-checked=true] .tx-switchThumb{transform:translateX(16px)}
 .tx-switch[data-mixed=true] .tx-switchThumb{transform:translateX(8px)}
 .tx-disclosure{appearance:none;font:inherit;text-align:left;cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:0;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:22px;align-self:flex-start}
 .tx-disclosure:hover{color:var(--dsw-alias-brand-primary)}
 .tx-disclosure:focus-visible{outline-offset:3px}
-.tx-effective{display:grid;grid-template-columns:1fr 1fr;gap:16px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-bg-layer-1);padding:12px}
+.tx-effective{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:8px 0}
 .tx-effectiveCol{display:flex;flex-direction:column;gap:6px;min-width:0}
 .tx-effectiveHead{color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500;line-height:18px}
 .tx-chips{display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
-.tx-chip{border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-secondary);font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);font-size:11px;line-height:18px;padding:0 7px;overflow-wrap:anywhere}
+.tx-chip{border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code);font-size:11px;line-height:18px;padding:0 7px;overflow-wrap:anywhere}
 .tx-chipOff{opacity:.6;text-decoration:line-through}
-.tx-manage{display:flex;flex-direction:column;gap:10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-bg-layer-1);padding:12px}
+.tx-manage{display:flex;flex-direction:column;gap:16px;padding:0}
 .tx-manageRow{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1.4fr) auto;gap:10px;align-items:end;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l1)}
 .tx-manageRow:first-of-type{border-top:none;padding-top:0}
-.tx-groupId{color:var(--dsw-alias-label-tertiary);font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);font-size:11px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px}
+.tx-groupId{color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:11px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px}
 .tx-rename{display:flex;align-items:center;gap:4px;min-width:0}
 .tx-renameInput{width:110px}
 .tx-field{display:flex;flex-direction:column;gap:4px;min-width:0}
@@ -1864,7 +2438,7 @@ window.__ModuleLoader__.load({
 .tx-input:focus{border-color:var(--dsw-alias-state-business-primary);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-business-primary)}
 .tx-input:disabled{opacity:.6}
 .tx-manageFoot{display:flex;align-items:center;gap:8px;justify-content:flex-end}
-.tx-addForm{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px dashed var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-2)}
+.tx-addForm{display:flex;flex-direction:column;gap:12px;padding:16px;border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-2)}
 .tx-addTitle{color:var(--dsw-alias-label-primary);font-size:12px;font-weight:500;line-height:18px}
 .tx-addGrid{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,1fr) minmax(0,1.4fr);gap:10px}
 .tx-addActions{display:flex;gap:8px}
@@ -1872,7 +2446,15 @@ window.__ModuleLoader__.load({
 .tx-errorTitle{font-size:14px;font-weight:500;line-height:20px;color:var(--dsw-alias-state-error-primary)}
 .tx-errorText{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
 .tx-errorHint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-@media (max-width:720px){.tx-effective{grid-template-columns:1fr}.tx-manageRow,.tx-addGrid{grid-template-columns:1fr}.tx-manageFoot{justify-content:flex-start}}
+@container tool-exposure (max-width:980px){.tx-workspace{grid-template-columns:minmax(0,1fr);gap:28px}.tx-rolePanel{position:static;max-height:none}.tx-roleGrid{display:flex;overflow-x:auto;scroll-snap-type:x proximity;padding-bottom:6px}.tx-roleCard{flex:0 0 224px;scroll-snap-align:start}}
+html[data-platform=darwin] .tx-head{padding-top:calc(28px + var(--dsh-frame-top-clearance,0px))}
+html[data-platform=darwin] .tx-topbar{padding-top:calc(10px + var(--dsh-frame-top-clearance,0px))}
+@media (max-width:767px){.tx-shell{--tx-page-inset:20px}}
+@container tool-exposure (max-width:620px){.tx-filterHint{display:none}}
+@container tool-exposure (max-width:620px){.tx-head{grid-template-columns:minmax(0,1fr);padding-bottom:24px}.tx-page{padding-top:0}.tx-workspace{gap:24px}.tx-roleCard{flex-basis:208px}.tx-roleIdentity{gap:4px 10px}.tx-stats{gap:6px 16px}.tx-toolControls{grid-template-columns:minmax(0,1fr)}.tx-toolControls>.tx-seg{justify-content:stretch}.tx-toolControls .tx-segBtn{flex:1}.tx-row{align-items:flex-start;flex-wrap:wrap;gap:12px}.tx-detailHead{flex-wrap:wrap}.tx-groupEnd{gap:6px}.tx-groupState{display:none}.tx-groupRow{gap:8px}.tx-groupIcon{width:36px;height:36px}.tx-groupIcon>.tx-icon{width:18px;height:18px}.tx-groupMain{gap:12px}.tx-groupMeta{font-size:11px;gap:4px}.tx-toolList{margin-inline-start:48px}.tx-draftHint{display:none}.tx-effective{grid-template-columns:1fr}.tx-manageRow,.tx-addGrid{grid-template-columns:1fr}.tx-manageFoot{justify-content:flex-start}.tx-rename{flex-wrap:wrap}.tx-chip{max-width:100%;box-sizing:border-box}}
+@media (hover:hover){.tx-btn:hover:not(:disabled),.tx-groupRow:hover,.tx-roleCard:hover:not([data-active=true]){background:var(--dsw-alias-interactive-bg-hover)}.tx-btnPrimary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.tx-segBtn:hover:not(:disabled){color:var(--dsw-alias-label-primary)}.tx-search:hover:not(:focus-within){border-color:var(--dsw-alias-border-l2)}}
+@media (pointer:coarse){.tx-search input,.tx-input{font-size:16px}.tx-btn{min-height:38px}}
+@media (prefers-reduced-motion:reduce){.tx-roleCard,.tx-chevron,.tx-switchThumb,.tx-segIndicator,.tx-segBtn{transition:none}.tx-notice,.tx-toolbar .tx-btn[aria-busy=true]>.tx-icon{animation:none}}
 `;
 
     /* ------------------------------------------------------------------ */
@@ -1892,6 +2474,9 @@ window.__ModuleLoader__.load({
         }
       }
       translateFn = makeTranslate(bound);
+      try { presetTranslateFn = ctx.locale?.bind?.('settings.agentPreset') || null; }
+      catch { presetTranslateFn = null; }
+      resolvePackageText = (text) => ctx.locale?.resolveText?.(text);
 
       ctx.effect(() => {
         const tag = document.createElement('style');
@@ -1903,21 +2488,40 @@ window.__ModuleLoader__.load({
         };
       }, 'tool-exposure: stylesheet');
 
-      ctx.slots.inject('settings.section', () =>
+      const memory = { snapshot: null, pendingSave: null, awaitingSnapshot: null };
+      ctx.slots.inject('main', () =>
         ctx.slots.register(
           {
-            name: 'settings.section',
-            id: 'tool-exposure',
-            order: 25,
-            label: () => t('nav'),
+            name: 'main',
+            key: PANEL_ID,
+            locale: NS,
+            inject: () => ({ memory, onReturn: () => ctx.layout.selectPanel(null) }),
           },
           ToolExposurePage,
         ),
       );
+      ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+        name: 'sidebar.panellist', id: PANEL_ID, order: 35, locale: NS, label: () => t('nav'),
+      }, ToolExposureIcon));
+      ctx.effect(() => {
+        const beforeUnload = (event) => {
+          if (!memory.snapshot?.dirty) return;
+          event.preventDefault();
+          event.returnValue = '';
+        };
+        window.addEventListener?.('beforeunload', beforeUnload);
+        return () => window.removeEventListener?.('beforeunload', beforeUnload);
+      }, 'tool-exposure: draft navigation');
+      ctx.effect(() => () => {
+        let layout;
+        try { layout = typeof ctx.get === 'function' ? ctx.get('layout') : ctx.layout; }
+        catch { return; /* The layout service already disposed. */ }
+        if (layout?.panelInfo.getSnapshot().activePanelId === PANEL_ID) layout.selectPanel(null);
+      }, 'tool-exposure: leave owned panel');
     }
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots', 'locale', 'layout'],
       apply,
     };
   },

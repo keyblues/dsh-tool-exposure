@@ -1,11 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Tool Exposure">
   <rect width="64" height="64" rx="14" fill="#2b6cb0"/>
-  <g fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round">
-    <rect x="13" y="14" width="17" height="16" rx="3"/>
-    <rect x="34" y="14" width="17" height="16" rx="3"/>
-    <rect x="13" y="35" width="17" height="14" rx="3"/>
-    <rect x="34" y="35" width="17" height="14" rx="3"/>
+  <g transform="translate(8 8) scale(2)">
+    <path d="M2.5 12C4.8 8.1 8.2 5.75 12 5.75s7.2 2.35 9.5 6.25c-2.3 3.9-5.7 6.25-9.5 6.25S4.8 15.9 2.5 12Z"
+          fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linejoin="round"/>
+    <circle cx="12" cy="12" r="2.6" fill="#ffffff"/>
   </g>
-  <path d="M18 22.5l2.6 2.6 4.4-5.2" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M39 42.5h7" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round"/>
 </svg>

@@ -1,7 +1,7 @@
 {
   "name": "dsh-tool-exposure",
-  "version": "1.0.0",
-  "description": "DeepSeek Harness (DSH) plugin: role-scoped tool exposure for agent presets — a Settings page that raises or lowers which tools registered by third-party plugins each role can see, applied through ctx.tools.restrict when the agent is created (snapshot semantics). DSH 插件：按角色（agent preset）管理第三方插件注册工具的暴露面，提供「角色 × 工具组」矩阵页，经 ctx.tools.restrict 在 agent 创建时生效（快照语义，配置保存只影响新建会话）。",
+  "version": "1.0.1",
+  "description": "DeepSeek Harness tool exposure by role: discover tools from actual registrations, group them by providing plugin, and keep official tools together. DSH 通用工具暴露管理：按实际注册插件自动分组，官方工具独立一组，按角色控制全局与预设继承工具。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -27,26 +27,40 @@
     "url": "https://github.com/keyblues/dsh-tool-exposure/issues"
   },
   "engines": {
-    "node": ">=20",
-    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+    "node": ">=24.9",
+    "dsh": ">=0.2.2-rc.3 <0.3.0-0"
   },
   "exports": {
     ".": "./index.js",
+    "./registry": "./registry.js",
+    "./registry/locale/*.json": "./locale/registry/*.json",
+    "./registry/icon": "./icon.svg",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "registry.js",
+    "providers.js",
     "client.js",
     "cordis.patch.yml",
-    "locale/*.json",
+    "locale",
     "icon.svg",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "scripts": {
-    "test": "node test/host-policy.mjs && node test/static-checks.mjs && node test/client-smoke.mjs"
+    "test": "node test/host-policy.mjs && node test/static-checks.mjs && node test/client-smoke.mjs && node test/registry-integration.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.3 <0.3.0-0",
+    "@deepseek-ai/dsh-scope": ">=0.2.2-rc.3 <0.3.0-0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.3"
   },
   "dsh": {
     "bundle": {
@@ -57,7 +71,8 @@
       "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-settings-general"
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
       ]
     }
   }

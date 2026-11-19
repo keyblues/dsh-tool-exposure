@@ -121,10 +121,11 @@ check('client: every request carries the guard header', () => {
   ok(clientSource.includes("cache: 'no-store'"), 'cache no-store missing');
 });
 
-check('client: settings.section registration options', () => {
-  ok(clientSource.includes("name: 'settings.section'"), 'slot name');
-  ok(clientSource.includes("id: 'tool-exposure'"), 'slot id');
-  ok(clientSource.includes('order: 25'), 'slot order');
+check('client: native sidebar entry and standalone main panel', () => {
+  ok(clientSource.includes("name: 'main'"), 'main slot');
+  ok(clientSource.includes('key: PANEL_ID'), 'main panel key');
+  ok(clientSource.includes("name: 'sidebar.panellist'"), 'sidebar slot');
+  ok(!clientSource.includes("name: 'settings.section'"), 'old settings entry removed');
   ok(clientSource.includes("label: () => t('nav')"), 'slot label');
 });
 
@@ -170,14 +171,20 @@ check('manifest: package.json declares the bundle and client halves', () => {
   eq(pkg.exports['./client'], './client.js', 'client export');
   eq(pkg.dsh.bundle.patch, './cordis.patch.yml', 'bundle patch');
   eq(pkg.dsh.client.platform, 'web', 'client platform');
-  ok(pkg.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-settings-general'), 'settings inject');
+  ok(pkg.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-layout'), 'layout inject');
+  ok(pkg.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-sidebar'), 'sidebar inject');
 });
 
 check('manifest: cordis.patch.yml row matches the package', () => {
   ok(patchText.includes('id: tool-exposure'), 'row id');
   ok(patchText.includes("name: 'dsh-tool-exposure'"), 'row name');
   ok(patchText.includes('unlisted: open'), 'default unlisted');
-  ok(patchText.includes('fofa_*'), 'default sources');
+  ok(patchText.includes('discovery: true'), 'automatic provider discovery');
+  ok(patchText.includes('sources: {}'), 'no preset tools or custom groups');
+  eq(pkg.exports['./registry'], './registry.js', 'tracking provider export');
+  for (const file of ['index.js', 'registry.js', 'providers.js', 'client.js', 'cordis.patch.yml']) {
+    ok(pkg.files.includes(file), `runtime file is packaged: ${file}`);
+  }
 });
 
 check('contract parity: route prefix / guard / source-id pattern / match limits', () => {

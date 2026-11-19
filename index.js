@@ -1,11 +1,11 @@
 /**
  * dsh-tool-exposure — Host half.
  *
- * 按角色（agent preset）管理「第三方插件注册的工具」的暴露面。
+ * 按角色（agent preset）管理继承工具的暴露面，按真实注册插件自动分组。
  *
  * 机制（全部基于 DSH 现有 API，不改任何内置插件）：
- *   - 受管工具集合 = config.sources 里各组 match 通配符对「全局工具名」展开的并集；
- *     未出现在任何组里的全局工具永远不受本插件影响。
+ *   - discovery 模式管理全局与 ancestor preset 工具，官方工具归为一组；
+ *     老配置保留 sources 匹配范围，agent 自身注册的工具不参与限制。
  *   - 角色 = agentPresets.composedPreset(agent.ctx)，即 agent 创建时选中的 preset。
  *   - 对每个新建 agent：解析出该角色应隐藏的受管工具，用 agent.ctx.tools.restrict({ deny })
  *     注册在 agent.ctx.effect() 上 —— 隐藏是「看不见 + 调不到」（UNKNOWN_TOOL），
@@ -13,8 +13,8 @@
  *   - 快照语义：只在 agent 创建时应用；已有会话保持创建时的工具面（配置保存只影响新会话）。
  *     唯一例外是「尚未开始第一步」的 agent：tools/change 时会重算一次，用于收掉
  *     MCP 等异步晚注册的工具。
- *   - restrict 的硬约束：未知名字 / 空过滤器 / scope-local 名字会抛错。这里只下发
- *     「当前确实已注册的全局工具名」，并跳过空 deny 列表。
+ *   - restrict 的硬约束：未知名字 / 空过滤器 / own-scope 名字会抛错。
+ *     这里只下发已注册的继承工具名，并跳过空 deny 列表。
  *
  * Client 半（client.js）在 Settings 里渲染矩阵页，通过本文件注册的同源路由读写：
  *   GET  {prefix}/ping
@@ -25,6 +25,9 @@
  * 所有请求必须带 x-dsh-tool-exposure-plugin: 1（插件路由 loopback-open，需自定义头
  * 让跨站页面无法构造简单请求）。
  */
+
+import { createHash } from 'node:crypto';
+import { providerGroup } from './providers.js';
 
 const TAG = '[dsh-tool-exposure]';
 
@@ -55,15 +58,6 @@ const RESYNC_DEBOUNCE_MS = 120;
 
 /** 保存请求体上限（矩阵配置本身很小，防御异常大包）。 */
 const MAX_BODY_BYTES = 256 * 1024;
-
-/** 首次安装时 patch 里的默认 sources（normalizeConfig 在 config 缺省时回退到这里）。 */
-const DEFAULT_SOURCES = {
-  fofatoto: { label: 'FOFA 测绘', match: ['fofa_*'] },
-  icp: { label: 'ICP 备案', match: ['mcp__icp__*'] },
-  fengniao: { label: '企业工商', match: ['fengniao_*'] },
-  everything: { label: '全盘检索', match: ['everything_*'] },
-  hdc: { label: '鸿蒙设备与 DevEco', match: ['hdc_*', 'hms_*'] },
-};
 
 /* ------------------------------------------------------------------ */
 /* 小工具                                                              */
@@ -185,13 +179,12 @@ function normalizeMatchList(raw) {
 
 /**
  * 把 patch 里的 raw config 归一成内部结构。
- * 注意：sources 显式写成 {} 表示「没有受管组」，只有字段缺省时才回退默认值；
- * 其它非对象形状（null/数组/字符串）按空集处理，不再静默装回默认组。
+ * 新安装自动发现工具。没有 discovery 字段的已有 sources 配置保留原有管理范围。
  */
 function normalizeConfig(raw) {
   const input = isObject(raw) ? raw : {};
   const sources = {};
-  const rawSources = input.sources === undefined ? DEFAULT_SOURCES : isObject(input.sources) ? input.sources : {};
+  const rawSources = isObject(input.sources) ? input.sources : {};
   for (const [id, source] of Object.entries(rawSources)) {
     // `sources['__proto__'] = ...` 会改原型而不是建属性，组会被静默吞掉；显式跳过。
     if (id === '__proto__') continue;
@@ -223,7 +216,12 @@ function normalizeConfig(raw) {
       roles[roleId] = { mode: role.mode === 'allow' ? 'allow' : 'open', groups, tools };
     }
   }
-  return { unlisted: input.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
+  const discovery = input.discovery === true || (input.discovery === undefined && input.sources === undefined);
+  return { discovery, unlisted: input.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
+}
+
+function configVersion(config) {
+  return createHash('sha256').update(JSON.stringify(config)).digest('hex');
 }
 
 /* ------------------------------------------------------------------ */
@@ -255,11 +253,30 @@ function globalToolNames(tools) {
   return [...names].sort();
 }
 
+/** Read registration-owned metadata, or expose an honest unknown-provider fallback. */
+function toolCatalogOf(tools, agent = null) {
+  try {
+    let catalog;
+    if (agent !== null && typeof tools.agentToolCatalog === 'function') catalog = tools.agentToolCatalog(agent);
+    else if (typeof tools.toolCatalog === 'function') catalog = tools.toolCatalog();
+    else {
+      const names = globalToolNames(tools);
+      if (names === null) return null;
+      catalog = names.map((name) => ({ name, description: toolDescription(tools, name), provider: null }));
+    }
+    if (!Array.isArray(catalog)) throw new TypeError('Tool catalog must be an array');
+    return catalog.filter((tool) => tool && typeof tool.name === 'string' && tool.name !== '' && !RESERVED_TOOL_NAMES.has(tool.name));
+  } catch (error) {
+    console.warn(`${TAG} tool catalog failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
 /**
- * 按 sources 的 match 把全局工具名归组。
- * 同一工具被多个组匹配时，按 sources 的书写顺序取第一个组。
+ * 全局 MCP 按服务器归组，其余官方工具归在一起。其他工具优先匹配自定义组。
+ * 关闭 discovery 时只使用自定义 sources 的第一个匹配组。
  */
-function buildToolIndex(config, names) {
+function buildToolIndex(config, names, catalog = []) {
   const groups = [];
   for (const [id, source] of Object.entries(config.sources)) {
     groups.push({
@@ -272,14 +289,26 @@ function buildToolIndex(config, names) {
   }
   const owner = new Map();
   const ungrouped = [];
+  const providers = new Map(catalog.map((tool) => [tool.name, tool.provider || null]));
+  const automatic = new Map();
+  const automaticGroup = (source) => {
+    if (!automatic.has(source.id)) {
+      automatic.set(source.id, { ...source, automatic: true, match: [], matchers: [], tools: [] });
+    }
+    return automatic.get(source.id);
+  };
+  const prioritized = (group) => group.kind === 'official' || group.kind === 'mcp';
   for (const name of names) {
-    let hit = null;
-    for (const group of groups) {
+    const provider = providers.get(name) || null;
+    const detected = config.discovery ? providerGroup(provider) : null;
+    let hit = detected && prioritized(detected) ? automaticGroup(detected) : null;
+    for (const group of hit === null ? groups : []) {
       if (group.matchers.some((matcher) => matcher.test(name))) {
         hit = group;
         break;
       }
     }
+    if (hit === null && detected) hit = automaticGroup(detected);
     if (hit === null) {
       ungrouped.push(name);
     } else {
@@ -287,8 +316,13 @@ function buildToolIndex(config, names) {
       owner.set(name, hit.id);
     }
   }
+  const rank = { official: 0, mcp: 1, plugin: 2, unknown: 3 };
+  const discovered = [...automatic.values()].sort((left, right) =>
+    rank[left.kind] - rank[right.kind] || left.label.localeCompare(right.label));
+  groups.unshift(...discovered.filter(prioritized));
+  groups.push(...discovered.filter((group) => !prioritized(group)));
   const managed = names.filter((name) => owner.has(name));
-  return { groups, owner, ungrouped, managed, registered: new Set(names) };
+  return { groups, owner, ungrouped, managed, registered: new Set(names), providers };
 }
 
 /** 某角色的原始配置项；未配置返回 null。 */
@@ -372,12 +406,13 @@ function applyAgentPolicy(ctx, agent, config, options = {}) {
   }
   setAgentState(agent, PENDING, false);
 
-  const names = globalToolNames(tools);
-  if (names === null) {
+  const catalog = toolCatalogOf(tools, config.discovery ? agent : null);
+  if (catalog === null) {
     // 注册表读取失败：保持当前掩码，不落 APPLIED（tools/change 后还会再试）。
     return false;
   }
-  const index = buildToolIndex(config, names);
+  const names = catalog.map((tool) => tool.name);
+  const index = buildToolIndex(config, names, catalog);
   const policy = resolveRolePolicy(config, roleId, index);
   const deny = [...policy.hidden].filter((name) => index.registered.has(name) && !RESERVED_TOOL_NAMES.has(name));
   const signature = `${roleId === null ? '' : roleId}|${deny.join(',')}`;
@@ -417,7 +452,7 @@ function applyAgentPolicy(ctx, agent, config, options = {}) {
         /* ignore */
       }
     }
-    // 未知名字 / scope-local 名字 / 空过滤器都会抛错。此时旧 restriction 已被释放，
+    // 未知名字 / own-scope 名字 / 空过滤器都会抛错。此时旧 restriction 已被释放，
     // 尽量把旧掩码装回去，避免一次失败把 agent 从「已收窄」变成「全开」（fail-open）。
     console.warn(
       `${TAG} restrict failed for role ${roleId === null ? '<unlisted>' : roleId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -566,8 +601,9 @@ async function listRoles(ctx) {
     if (id === '') continue;
     roles.push({
       id,
-      name: typeof row.name === 'string' && row.name !== '' ? row.name : id,
-      description: typeof row.description === 'string' ? row.description : '',
+      // Missing names identify shipped presets whose display copy belongs to the Client locale.
+      name: typeof row.name === 'string' ? row.name : undefined,
+      description: typeof row.description === 'string' ? row.description : undefined,
       order: typeof row.order === 'number' && Number.isFinite(row.order) ? row.order : null,
       isDefault: defaults.has(id),
       broken: typeof row.broken === 'string' ? row.broken : null,
@@ -587,22 +623,91 @@ function toolDescription(tools, name) {
   }
 }
 
+/** Resolve display assets through DSH's package reader once per module and resolution base. */
+function makeProviderDisplay(ctx) {
+  const packages = optionalService(ctx, 'pluginPackages');
+  const metadata = [];
+  const references = new Map();
+  function lookup(specifier, baseUrl) {
+    if (typeof packages?.metaOf !== 'function' || typeof baseUrl !== 'string' || !specifier) return undefined;
+    const key = JSON.stringify([baseUrl, specifier]);
+    if (references.has(key)) return references.get(key);
+    let id;
+    try {
+      const meta = packages.metaOf(specifier, baseUrl);
+      if (meta?.title !== undefined || typeof meta?.icon === 'string') {
+        id = metadata.length;
+        metadata.push({ title: meta.title, icon: meta.icon });
+      }
+    } catch {
+      // Metadata is optional. Keep the provider identity even when its files cannot be read.
+    }
+    references.set(key, id);
+    return id;
+  }
+  return {
+    metadata,
+    project(provider) {
+      if (!provider) return null;
+      const { plugin, module, official, mcpServer } = provider;
+      const baseUrl = provider.baseUrl ?? ctx.baseUrl;
+      return {
+        plugin, module, official, mcpServer,
+        packageMeta: lookup(plugin, baseUrl),
+        moduleMeta: module !== plugin ? lookup(module, baseUrl) : undefined,
+      };
+    },
+  };
+}
+
 /** 组装矩阵页所需的完整数据。 */
 async function buildInventory(ctx, config) {
   const tools = ctx.tools;
-  const names = globalToolNames(tools);
+  const globalCatalog = toolCatalogOf(tools);
   const diagnostics = [];
-  if (names === null) {
+  if (globalCatalog === null) {
     diagnostics.push({
       level: 'error',
       text: '工具注册表读取失败（tools.schemas() 抛错），本次矩阵可能不完整；现有会话的掩码保持不变。',
     });
   }
-  const index = buildToolIndex(config, names === null ? [] : names);
   const roles = await listRoles(ctx);
+  const presets = optionalService(ctx, 'agentPresets');
+  const roleCatalogs = new Map();
+  const allTools = new Map((globalCatalog || []).map((tool) => [tool.name, tool]));
+  if (config.discovery && typeof tools.presetToolCatalog !== 'function') {
+    diagnostics.push({ level: 'warn', text: '工具来源跟踪服务尚未加载；当前仅显示全局工具，来源记为未知。请通过插件管理安装完整组合包并重启 DSH。' });
+  }
+  for (const role of roles) {
+    let catalog = globalCatalog || [];
+    if (!role.broken && presets && typeof tools.presetToolCatalog === 'function') {
+      try {
+        catalog = await tools.presetToolCatalog(presets, role.id);
+      } catch (error) {
+        diagnostics.push({ level: 'error', text: `读取角色「${role.id}」的工具失败：${error instanceof Error ? error.message : String(error)}` });
+      }
+    }
+    roleCatalogs.set(role.id, catalog);
+    for (const tool of catalog) if (!RESERVED_TOOL_NAMES.has(tool.name)) allTools.set(tool.name, tool);
+  }
+  const catalog = (config.discovery ? [...allTools.values()] : globalCatalog || []).filter((tool) => !RESERVED_TOOL_NAMES.has(tool.name));
+  const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
+  const globalIndex = buildToolIndex(config, (globalCatalog || []).map((tool) => tool.name), globalCatalog || []);
+  const roleIndexes = new Map(roles.map((role) => {
+    const items = config.discovery ? roleCatalogs.get(role.id) : globalCatalog || [];
+    return [role.id, buildToolIndex(config, items.map((tool) => tool.name), items)];
+  }));
+  const groupMatches = new Map();
+  for (const candidate of [globalIndex, ...roleIndexes.values()]) {
+    for (const group of candidate.groups) {
+      if (!groupMatches.has(group.id)) groupMatches.set(group.id, new Set());
+      for (const name of group.tools) groupMatches.get(group.id).add(name);
+    }
+  }
   const roleIds = new Set(roles.map((role) => role.id));
 
   for (const group of index.groups) {
+    if (group.automatic) continue;
     if (!SOURCE_ID_PATTERN.test(group.id)) {
       diagnostics.push({ level: 'warn', text: `工具组 id 不合法：${group.id}（页面保存会被拒绝，请用「改名」修正）` });
     }
@@ -611,7 +716,7 @@ async function buildInventory(ctx, config) {
         level: 'warn',
         text: `工具组「${group.label}」(${group.id}) 的 match 为空，不会匹配任何工具（策略可能比预期更宽）`,
       });
-    } else if (group.tools.length === 0) {
+    } else if ((groupMatches.get(group.id)?.size || 0) === 0 && !group.match.includes('*')) {
       diagnostics.push({ level: 'warn', text: `工具组「${group.label}」(${group.id}) 当前没有匹配到任何已注册工具` });
     }
   }
@@ -624,13 +729,14 @@ async function buildInventory(ctx, config) {
     }
   }
   for (const [roleId, role] of Object.entries(config.roles)) {
+    const roleIndex = roleIndexes.get(roleId) || globalIndex;
     for (const groupId of Object.keys(role.groups)) {
-      if (!index.groups.some((group) => group.id === groupId)) {
+      if (!roleIndex.groups.some((group) => group.id === groupId)) {
         diagnostics.push({ level: 'warn', text: `角色「${roleId}」引用了不存在的工具组「${groupId}」` });
       }
     }
     for (const name of Object.keys(role.tools)) {
-      if (!index.owner.has(name)) {
+      if (!roleIndex.owner.has(name)) {
         diagnostics.push({ level: 'warn', text: `角色「${roleId}」引用了未受管的工具「${name}」` });
       }
     }
@@ -638,7 +744,8 @@ async function buildInventory(ctx, config) {
 
   const roleViews = roles.map((role) => {
     const entry = roleEntryOf(config, role.id);
-    const policy = resolveRolePolicy(config, role.id, index);
+    const roleIndex = roleIndexes.get(role.id);
+    const policy = resolveRolePolicy(config, role.id, roleIndex);
     return {
       id: role.id,
       name: role.name,
@@ -649,11 +756,24 @@ async function buildInventory(ctx, config) {
       mode: entry === null ? (config.unlisted === 'closed' ? 'allow' : 'open') : entry.mode,
       groups: entry === null ? {} : entry.groups,
       tools: entry === null ? {} : entry.tools,
-      managed: index.managed.length,
+      managed: roleIndex.managed.length,
       visible: policy.visible.size,
       hidden: policy.hidden.size,
     };
   });
+
+  const providerDisplay = makeProviderDisplay(ctx);
+  const wireCatalog = (items) => {
+    const itemIndex = buildToolIndex(config, items.map((tool) => tool.name), items);
+    return items.map((tool) => ({
+      name: tool.name,
+      source: itemIndex.owner.get(tool.name) || null,
+      description: tool.description,
+      provider: providerDisplay.project(tool.provider),
+    }));
+  };
+  const globalTools = wireCatalog(globalCatalog || []);
+  const roleTools = Object.fromEntries([...roleCatalogs].map(([id, items]) => [id, wireCatalog(items)]));
 
   const editor = optionalService(ctx, 'configEditor');
   const editable = Boolean(editor && typeof editor.edit === 'function');
@@ -672,20 +792,21 @@ async function buildInventory(ctx, config) {
   return {
     ok: true,
     rowId: ROW_ID,
+    configVersion: configVersion(config),
+    discovery: config.discovery,
     unlisted: config.unlisted,
-    sources: index.groups.map((group) => ({
+    sources: index.groups.filter((group) => !group.automatic).map((group) => ({
       id: group.id,
       label: group.label,
       match: group.match,
-      toolCount: group.tools.length,
+      toolCount: groupMatches.get(group.id)?.size || 0,
     })),
     roles: roleViews,
     orphanRoles,
-    tools: (names === null ? [] : names).map((name) => ({
-      name,
-      source: index.owner.get(name) || null,
-      description: toolDescription(tools, name),
-    })),
+    tools: globalTools,
+    globalTools,
+    roleTools,
+    providerMetadata: providerDisplay.metadata,
     managed: index.managed.length,
     ungrouped: index.ungrouped,
     diagnostics,
@@ -698,11 +819,15 @@ async function buildInventory(ctx, config) {
 /** 某角色（或未配置角色）的最终可见清单，供页面预览与验收。 */
 async function buildEffective(ctx, config, roleId) {
   const tools = ctx.tools;
-  const names = globalToolNames(tools);
-  const index = buildToolIndex(config, names === null ? [] : names);
+  let catalog = toolCatalogOf(tools) || [];
   const roles = await listRoles(ctx);
   const role = typeof roleId === 'string' && roleId !== '' ? roleId : null;
   const known = role === null ? false : roles.some((item) => item.id === role);
+  const presets = optionalService(ctx, 'agentPresets');
+  if (config.discovery && known && presets && typeof tools.presetToolCatalog === 'function') {
+    catalog = await tools.presetToolCatalog(presets, role);
+  }
+  const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
   const policy = resolveRolePolicy(config, role, index);
   return {
     ok: true,
@@ -745,11 +870,13 @@ const SOURCE_ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 function normalizeDraft(input) {
   const errors = [];
   const draft = isObject(input) ? input : {};
-  // sources 是受管集合的唯一来源：缺字段时拒绝保存，避免一次空请求把现有配置清空。
+  // 自定义分组与自动发现开关一起保存；缺字段时拒绝清空已有分组。
   if (!isObject(draft.sources)) errors.push('缺少 sources 字段：拒绝用空请求覆盖现有工具组配置');
   // roles 同样是覆盖写：缺字段/非对象时拒绝，避免旧客户端或脚本静默清空角色策略。
   if (!isObject(draft.roles)) errors.push('缺少 roles 字段：拒绝用空请求覆盖现有角色策略');
   const unlisted = draft.unlisted === 'closed' ? 'closed' : 'open';
+  if (draft.discovery !== undefined && typeof draft.discovery !== 'boolean') errors.push('discovery 必须是布尔值');
+  const discovery = draft.discovery === true;
 
   const sources = {};
   const rawSources = isObject(draft.sources) ? draft.sources : {};
@@ -815,13 +942,17 @@ function normalizeDraft(input) {
     roles[roleId] = { mode: role.mode === 'allow' ? 'allow' : 'open', groups, tools };
   }
 
-  return { errors, config: { unlisted, sources, roles } };
+  return { errors, config: { discovery, unlisted, sources, roles } };
 }
 
 /** 把矩阵草稿写回本插件在 profile 中的配置行。 */
 async function saveDraft(ctx, draft) {
   const { errors, config } = normalizeDraft(draft);
   if (errors.length > 0) return { status: 400, body: { ok: false, error: errors.join('；') } };
+  const expectedVersion = draft.configVersion;
+  if (expectedVersion !== undefined && (typeof expectedVersion !== 'string' || !/^[a-f0-9]{64}$/.test(expectedVersion))) {
+    return { status: 400, body: { ok: false, error: 'Invalid configVersion' } };
+  }
   const editor = optionalService(ctx, 'configEditor');
   if (!editor || typeof editor.edit !== 'function') {
     return {
@@ -837,8 +968,21 @@ async function saveDraft(ctx, draft) {
       body: { ok: false, error: `找不到本插件在 profile 中的配置行（id: ${ROW_ID}），请直接编辑本 profile 的 cordis.patch.yml。` },
     };
   }
-  await editor.edit(entry, () => config);
-  return { status: 200, body: { ok: true, saved: true, appliedTo: 'new-sessions' } };
+  const savedVersion = configVersion(config);
+  await editor.edit(entry, (current) => {
+    // The editor reads the current value under its write lock, including changes
+    // from another window or a manual profile edit.
+    if (expectedVersion !== undefined) {
+      const currentVersion = configVersion(normalizeConfig(current));
+      if (currentVersion !== expectedVersion && currentVersion !== savedVersion) {
+        const error = httpError(409, 'The tool exposure configuration changed. Rescan before saving again.');
+        error.code = 'config_conflict';
+        throw error;
+      }
+    }
+    return config;
+  });
+  return { status: 200, body: { ok: true, saved: true, appliedTo: 'new-sessions', configVersion: savedVersion } };
 }
 
 /* ------------------------------------------------------------------ */
@@ -984,13 +1128,13 @@ function createRouteHandler(ctx, config) {
         const list = agents && typeof agents.list === 'function' ? agents.list() : [];
         const rows = [];
         for (const agent of Array.isArray(list) ? list : []) {
-          let names = [];
+          let catalog = [];
           try {
-            names = globalToolNames(agent.ctx.tools);
+            catalog = toolCatalogOf(agent.ctx.tools, config.discovery ? agent : null) || [];
           } catch {
-            names = [];
+            /* The agent scope may already have been disposed. */
           }
-          const index = buildToolIndex(config, names === null ? [] : names);
+          const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
           const roleId = roleOfAgent(ctx, agent);
           const policy = resolveRolePolicy(config, roleId, index);
           const deny = [...policy.hidden].filter((name) => index.registered.has(name));
@@ -1049,6 +1193,10 @@ function createRouteHandler(ctx, config) {
       sendJson(res, 404, { ok: false, error: 'not found' });
     } catch (error) {
       const status = error && typeof error.status === 'number' ? error.status : 500;
+      if (status === 409 && error.code === 'config_conflict') {
+        sendJson(res, status, { ok: false, error: error.message, code: error.code });
+        return;
+      }
       sendJson(res, status, { ok: false, error: error instanceof Error ? error.message : String(error) });
     }
   };
@@ -1165,7 +1313,6 @@ export function apply(ctx, rawConfig) {
 
 /** 仅本地测试使用；不属于插件契约。 */
 export const __test = {
-  DEFAULT_SOURCES,
   ROW_ID,
   ROUTE_PREFIX,
   APPLIED,

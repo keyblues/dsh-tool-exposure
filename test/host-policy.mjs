@@ -30,16 +30,92 @@ function ok(condition, label) {
 
 /* ------------------------- config normalization ------------------------- */
 
-check('normalizeConfig: empty config falls back to the five default sources', () => {
+check('normalizeConfig: fresh installation discovers providers with no preset tools or groups', () => {
   const config = T.normalizeConfig({});
-  eq(Object.keys(config.sources).sort(), ['everything', 'fengniao', 'fofatoto', 'hdc', 'icp'], 'sources');
+  eq(config.sources, {}, 'no hardcoded groups');
+  eq(config.discovery, true, 'automatic discovery enabled');
   eq(config.unlisted, 'open', 'unlisted');
   eq(config.roles, {}, 'roles');
+});
+
+check('default policy: discovers arbitrary tools and presets without installation-specific names', () => {
+  const config = T.normalizeConfig({});
+  for (const names of [[], ['weatherForecast'], ['mcp__calendar__events', 'notes_find', 'vendor.custom-tool']]) {
+    const index = T.buildToolIndex(config, names);
+    eq(index.managed, names, 'all registered tools managed');
+    eq(index.ungrouped, [], 'no setup needed');
+    const policy = T.resolveRolePolicy(config, 'Research.Team v2', index);
+    eq([...policy.visible], names, 'new roles keep all tools visible');
+    eq([...policy.hidden], [], 'installing applies no restrictions');
+  }
+});
+
+check('default policy: allow-list works per tool without custom groups', () => {
+  const config = T.normalizeConfig({
+    roles: { reviewer: { mode: 'allow', tools: { notes_find: 'on' } } },
+  });
+  const names = T.globalToolNames({ schemas: () => ['mcp__calendar__events', 'notes_find', 'run_code'].map((name) => ({ name })) });
+  const policy = T.resolveRolePolicy(config, 'reviewer', T.buildToolIndex(config, names));
+  eq([...policy.visible], ['notes_find'], 'per-tool allow-list');
+  eq([...policy.hidden], ['mcp__calendar__events'], 'other shared tools hidden');
+  ok(!names.includes('run_code'), 'reserved transport stays outside the policy');
+});
+
+check('custom groups take priority over the automatic unknown-provider fallback', () => {
+  const config = T.normalizeConfig({
+    discovery: true,
+    sources: { notes: { match: ['notes_*'] } },
+    roles: { reviewer: { mode: 'open', groups: { notes: 'off' } } },
+  });
+  const index = T.buildToolIndex(config, ['notes_find', 'weatherForecast']);
+  eq(index.owner.get('notes_find'), 'notes', 'custom ownership');
+  eq(index.owner.get('weatherForecast'), '@unknown', 'fallback ownership');
+  eq([...T.resolveRolePolicy(config, 'reviewer', index).hidden], ['notes_find'], 'group-specific policy');
 });
 
 check('normalizeConfig: explicit empty sources stays empty (no default resurrection)', () => {
   const config = T.normalizeConfig({ sources: {}, roles: {} });
   eq(Object.keys(config.sources), [], 'sources');
+  eq(config.discovery, false, 'existing manual scope is preserved');
+});
+
+check('automatic groups: real providers determine identity and official tools stay together', () => {
+  const catalog = [
+    { name: 'official_looking', provider: { plugin: '@vendor/a', official: false } },
+    { name: 'same_prefix_a', provider: { plugin: '@deepseek-ai/dsh-tool-a', official: true } },
+    { name: 'same_prefix_b', provider: { plugin: '@deepseek-ai/dsh-tool-b', official: true } },
+    { name: 'same_prefix_c', provider: { plugin: '@vendor/b', official: false } },
+  ];
+  const config = T.normalizeConfig({ discovery: true, sources: { all: { match: ['*'] } } });
+  const index = T.buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
+  eq(index.groups[0].id, '@official', 'official group first');
+  eq(index.groups[0].tools, ['same_prefix_a', 'same_prefix_b'], 'official providers share a group');
+  eq(index.owner.get('official_looking'), 'all', 'custom grouping');
+  eq(index.providers.get('official_looking').plugin, '@vendor/a', 'real provider retained');
+  eq(index.owner.get('same_prefix_a'), '@official', 'wildcard cannot swallow official tools');
+});
+
+check('automatic groups: each global MCP server has its own policy', () => {
+  const bridge = { plugin: '@deepseek-ai/dsh-mcp-client', official: true };
+  const catalog = [
+    { name: 'read', provider: { plugin: '@deepseek-ai/dsh-tool-files', official: true } },
+    { name: 'mcp__ida__lookup', provider: { ...bridge, mcpServer: 'ida' } },
+    { name: 'mcp__notes__lookup', provider: { ...bridge, mcpServer: 'notes' } },
+    { name: 'mcp__scoped__lookup', provider: bridge },
+    { name: 'mcp__fake__lookup', provider: { plugin: 'some-other-plugin', official: false } },
+  ];
+  const config = T.normalizeConfig({
+    discovery: true,
+    sources: { all: { match: ['*'] } },
+    roles: { standard: { groups: { '@official': 'off', '@mcp/ida': 'off' } } },
+  });
+  const index = T.buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
+  eq(index.groups.map((group) => group.id), ['@official', '@mcp/ida', '@mcp/notes', 'all'], 'group order');
+  eq(index.owner.get('mcp__scoped__lookup'), '@official', 'scoped bridge keeps its provider group');
+  eq(index.owner.get('mcp__fake__lookup'), 'all', 'a tool name alone cannot identify an MCP server');
+  eq([...T.resolveRolePolicy(config, 'standard', index).hidden], ['read', 'mcp__ida__lookup', 'mcp__scoped__lookup'], 'independent overrides');
+  const manual = T.buildToolIndex({ ...config, discovery: false }, catalog.map((tool) => tool.name), catalog);
+  eq(manual.groups.map((group) => group.id), ['all'], 'manual rules');
 });
 
 check('normalizeConfig: __proto__ keys cannot hijack the config maps', () => {
@@ -147,6 +223,7 @@ check('normalizeDraft: valid draft round-trips through normalizeConfig', () => {
   });
   eq(result.errors, [], 'errors');
   eq(result.config, {
+    discovery: false,
     unlisted: 'closed',
     sources: { fofa: { label: 'FOFA', match: ['fofa_*'] } },
     roles: { expert: { mode: 'allow', groups: { fofa: 'on' }, tools: { a: 'off' } } },
@@ -641,6 +718,48 @@ check('buildInventory: roster order kept and isDefault read from remoteExportLis
   eq(orderedInventory.roles[1].isDefault, false, 'non-default flag');
   eq(orderedInventory.roles[0].name, 'A', 'name');
 });
+check('buildInventory: preserve missing preset metadata for Client localization', () => {
+  eq(orderedInventory.roles[1].name, undefined, 'missing name is not replaced with the preset id');
+  eq(orderedInventory.roles[1].description, undefined, 'missing description stays missing');
+  const wire = JSON.parse(JSON.stringify(orderedInventory.roles[1]));
+  eq(Object.hasOwn(wire, 'name'), false, 'wire retains the distinction between built-in and authored names');
+  eq(wire.id, 'b', 'stable preset identity is unchanged');
+});
+
+const perRoleCatalogs = {
+  a: [{ name: 'read', provider: { plugin: '@deepseek-ai/dsh-tool-files', official: true } }],
+  b: [{ name: 'read', provider: { plugin: '@vendor/documents', official: false } }],
+};
+const scopedCatalogCtx = {
+  tools: {
+    toolCatalog: () => [],
+    presetToolCatalog: async (_presets, id) => perRoleCatalogs[id],
+  },
+  get(name) {
+    return name === 'agentPresets' ? { list: async () => [{ id: 'a' }, { id: 'b' }] } : undefined;
+  },
+};
+const perRoleInventory = await T.buildInventory(scopedCatalogCtx, T.normalizeConfig({
+  discovery: true,
+  sources: { documents: { match: ['read'] } },
+  roles: { a: { mode: 'open', groups: { '@official': 'off' } } },
+}));
+check('buildInventory: same-named tools in different presets do not corrupt source diagnostics', () => {
+  eq(perRoleInventory.diagnostics, [], 'no false missing-group or empty-match warning');
+  eq(perRoleInventory.roleTools.a[0].source, '@official', 'official role source');
+  eq(perRoleInventory.roleTools.b[0].source, 'documents', 'third-party custom group');
+  eq(perRoleInventory.sources[0].toolCount, 1, 'custom group matches another preset');
+  eq(perRoleInventory.roles.find((role) => role.id === 'a').hidden, 1, 'official policy applied');
+});
+
+const manualCatalogInventory = await T.buildInventory(scopedCatalogCtx, T.normalizeConfig({
+  discovery: false, sources: { documents: { match: ['read'] } },
+}));
+check('buildInventory: full role catalogs remain available when saved discovery is off', () => {
+  eq(manualCatalogInventory.roleTools.a.map((tool) => tool.name), ['read'], 'full role catalog for draft preview');
+  eq(manualCatalogInventory.globalTools, [], 'separate global scope');
+  eq(manualCatalogInventory.roles[0].managed, 0, 'saved manual policy stays global-only');
+});
 
 /* ----------------------- route handler integration --------------------- */
 
@@ -757,6 +876,31 @@ check('route: /inventory renders roles and sources', () => {
   eq(inventory.payload.managed, 1, 'managed');
 });
 
+let currentConfig = ROUTE_CONFIG;
+const editingHandler = T.createRouteHandler(routeCtx({
+  entries: routeEditor.entries,
+  async edit(_entry, update) {
+    currentConfig = update(currentConfig);
+  },
+}), ROUTE_CONFIG);
+const saveFromWindow = (draft) => callRoute(editingHandler, fakeRequest(
+  'POST', '/plugins/dsh-tool-exposure/save', guard, JSON.stringify(draft),
+));
+const olderDraft = { ...JSON.parse(validBody), configVersion: inventory.payload.configVersion };
+const firstSave = await saveFromWindow(olderDraft);
+const secondSave = await saveFromWindow({ ...olderDraft, unlisted: 'closed' });
+const repeatedSave = await saveFromWindow(olderDraft);
+check('route: a stale window cannot replace a newer save under the editor lock', () => {
+  ok(/^[a-f0-9]{64}$/.test(olderDraft.configVersion), 'inventory reports a revision');
+  eq(firstSave.status, 200, 'first save');
+  ok(firstSave.payload.configVersion !== olderDraft.configVersion, 'save returns the new revision');
+  eq(secondSave.status, 409, 'stale save');
+  eq(secondSave.payload.code, 'config_conflict', 'conflict response');
+  eq(currentConfig.unlisted, 'open', 'first save preserved');
+  eq(currentConfig.roles.expert.mode, 'allow', 'first role policy preserved');
+  eq(repeatedSave.payload.configVersion, firstSave.payload.configVersion, 'replaying the same save is safe');
+});
+
 const badJson = await callRoute(
   routeHandler,
   fakeRequest('POST', '/plugins/dsh-tool-exposure/save', { ...guard, origin: 'http://127.0.0.1:1130' }, '{not json'),
@@ -797,6 +941,20 @@ const debugAgent = makeAgent('expert');
 T.setAgentState(debugAgent, T.LEGACY, true);
 const debugHandler = T.createRouteHandler(routeCtx(undefined, [debugAgent]), ROUTE_CONFIG);
 const debugResult = await callRoute(debugHandler, fakeRequest('POST', '/plugins/dsh-tool-exposure/debug/apply', guard));
+const scopedAgent = makeAgent('expert');
+scopedAgent.ctx.tools.agentToolCatalog = () => [
+  { name: 'inherited_read', provider: { plugin: '@deepseek-ai/dsh-tool-files', official: true } },
+  { name: 'vendor_notes', provider: { plugin: 'vendor-notes', official: false } },
+];
+const debugConfig = T.normalizeConfig({ roles: { expert: { groups: { '@official': 'off' } } } });
+const scopedHandler = T.createRouteHandler(makePluginCtx([scopedAgent]), debugConfig);
+const scopedDebug = await callRoute(scopedHandler, fakeRequest('GET', '/plugins/dsh-tool-exposure/debug/agents', guard));
+
+check('route: agent diagnostics use inherited tools and their real providers', () => {
+  eq(scopedDebug.status, 200, 'diagnostics status');
+  eq(scopedDebug.payload.agents[0].managed, 2, 'inherited tools counted');
+  eq(scopedDebug.payload.agents[0].denyCount, 1, 'official group restriction counted');
+});
 
 check('route: request errors and editor failures map to HTTP status', () => {
   eq(badJson.status, 400, 'bad JSON 400');
