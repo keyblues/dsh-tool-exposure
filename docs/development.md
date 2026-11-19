@@ -36,6 +36,14 @@ node test/visual-server.mjs
 
 README 的功能截图使用独立配置中的示例角色、插件和 MCP 服务器。更新截图时可在预览中复现。
 
+## 发布 npm 包
+
+更新 `package.json` 的版本并推送后，在 GitHub 发布对应的 Release。标签使用 `v` 加完整版本号，例如 `v1.0.2`。
+
+GitHub Actions 从该标签对应的提交运行测试并打包，通过 npm Trusted Publishing 发布。稳定版使用 `latest`，预发行版使用 `next`。工作流与 npm 上的发布状态可从 Release 对应的 Actions 记录查看。
+
+该包通过 `keyblues/dsh-tool-exposure` 仓库中的 `publish-npm.yml` 使用 Trusted Publishing。[npm 配置说明](https://docs.npmjs.com/trusted-publishers/)
+
 ## 本机诊断
 
 路由前缀为 `/plugins/dsh-tool-exposure`。从当前 DSH Web 源访问时，附上 `x-dsh-tool-exposure-plugin: 1` 请求头。宿主同时校验请求的 `Host` 和 `Origin`。

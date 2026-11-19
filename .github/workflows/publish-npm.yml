@@ -1,0 +1,90 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-npm-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'keyblues/dsh-tool-exposure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm install --ignore-scripts --no-package-lock
+      - run: npm test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
+      - name: Check and pack the release
+        id: package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          pack_details="$RUNNER_TEMP/npm-pack.json"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP" > "$pack_details"
+
+          node --input-type=module - "$pack_details" <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const [pack] = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          if (process.env.RELEASE_TAG !== `v${pack.version}`) {
+            throw new Error(`Release tag ${process.env.RELEASE_TAG} must match v${pack.version}`);
+          }
+
+          const name = encodeURIComponent(pack.name);
+          const version = encodeURIComponent(pack.version);
+          const registryUrl = `https://registry.npmjs.org/${name}/${version}`;
+          const response = await fetch(registryUrl, { signal: AbortSignal.timeout(15_000) });
+          if (response.ok) {
+            const published = await response.json();
+            if (published.dist?.integrity !== pack.integrity) {
+              throw new Error(`npm already has a different archive for ${pack.name}@${pack.version}`);
+            }
+            console.log(`${pack.name}@${pack.version} is already published with this archive`);
+          } else if (response.status !== 404) {
+            throw new Error(`npm registry lookup failed with HTTP ${response.status}`);
+          }
+
+          const archive = join(process.env.RUNNER_TEMP, pack.filename);
+          const prerelease = process.env.PRERELEASE === 'true' || pack.version.includes('-');
+          appendFileSync(process.env.GITHUB_OUTPUT, `archive=${archive}\npublish=${!response.ok}\nprerelease=${prerelease}\n`);
+          NODE
+      - name: Publish via npm Trusted Publishing
+        if: steps.package.outputs.publish == 'true'
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          PRERELEASE: ${{ steps.package.outputs.prerelease }}
+        run: |
+          if [[ "$PRERELEASE" == true ]]; then
+            npm publish "$ARCHIVE" --ignore-scripts --tag next
+          else
+            npm publish "$ARCHIVE" --ignore-scripts
+          fi

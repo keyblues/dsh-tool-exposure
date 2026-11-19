@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-exposure",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "DeepSeek Harness tool exposure by role: discover tools from actual registrations, group them by providing plugin, and keep official tools together. DSH 通用工具暴露管理：按实际注册插件自动分组，官方工具独立一组，按角色控制全局与预设继承工具。",
   "keywords": [
     "dsh",
