@@ -26,6 +26,10 @@
   "bugs": {
     "url": "https://github.com/keyblues/dsh-tool-exposure/issues"
   },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "engines": {
     "node": ">=24.9",
     "dsh": ">=0.2.2-rc.3 <0.3.0-0"
@@ -47,6 +51,7 @@
     "cordis.patch.yml",
     "locale",
     "icon.svg",
+    "screenshots.json",
     "LICENSE",
     "README.md",
     "docs"

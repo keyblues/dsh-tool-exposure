@@ -22,6 +22,8 @@
 
 ![在 DSH 的安装第三方插件对话框中粘贴 GitHub 仓库链接](docs/images/install-from-github.png)
 
+也可以在同一个输入框填写 npm 包名 `dsh-tool-exposure`。[查看 npm 包](https://www.npmjs.com/package/dsh-tool-exposure)
+
 ## 快速使用
 
 1. 选择要配置的角色。角色卡片显示名称、说明、预设 ID 和可见工具数量。
