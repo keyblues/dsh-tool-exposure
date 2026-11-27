@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Tool Exposure",
-    "description": "Choose which tools each role can use. Toggle individual tools, plugin groups, or MCP server groups. Saved rules apply to new sessions."
+    "description": "Choose which tools each role can use. Toggle individual tools, plugin groups, or MCP server groups; hiding an MCP server also hides its system-prompt text. Saved rules apply to new sessions."
   }
 }

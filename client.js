@@ -108,6 +108,7 @@ window.__ModuleLoader__.load({
         unknownProvider: 'Unknown provider',
         providerLabel: 'Provided by {plugin}',
         mcpServer: 'MCP server',
+        mcpPromptOnly: 'no tools · this switch also controls the server’s prompt text',
         automaticGroup: 'Detected from registrations',
         noGlobalTools: 'This role has no manageable tools.',
         groupTools: '{count} tools',
@@ -239,6 +240,7 @@ window.__ModuleLoader__.load({
         unknownProvider: '来源未知',
         providerLabel: '提供插件：{plugin}',
         mcpServer: 'MCP 服务器',
+        mcpPromptOnly: '无工具 · 开关同时控制该服务器的提示词',
         automaticGroup: '根据注册来源自动识别',
         noGlobalTools: '此角色暂无可管理的工具。',
         groupTools: '{count} 个工具',
@@ -586,7 +588,7 @@ window.__ModuleLoader__.load({
       return { discovery: payload.discovery === true, unlisted: payload.unlisted === 'closed' ? 'closed' : 'open', sources, roles };
     }
 
-    function buildLocalIndex(sources, names, discovery = false, catalog = []) {
+    function buildLocalIndex(sources, names, discovery = false, catalog = [], servers = []) {
       const groups = [];
       for (const id of Object.keys(sources)) {
         const source = sources[id];
@@ -634,6 +636,18 @@ window.__ModuleLoader__.load({
           owner.set(name, hit.id);
         }
       }
+      // 与 Host 半一致：没有工具的 MCP 服务器也成组，开关管理其提示词可见性。
+      if (discovery) {
+        for (const server of servers) {
+          if (typeof server !== 'string' || server === '' || !/^[A-Za-z0-9_-]{1,32}$/.test(server)) continue;
+          const id = `@mcp/${server}`;
+          if (!automatic.has(id)) {
+            automatic.set(id, {
+              id, label: server, kind: 'mcp', automatic: true, match: [], matchers: [], tools: [],
+            });
+          }
+        }
+      }
       const rank = { official: 0, mcp: 1, plugin: 2, unknown: 3 };
       const discovered = [...automatic.values()].sort((left, right) =>
         rank[left.kind] - rank[right.kind] || left.label.localeCompare(right.label));
@@ -665,6 +679,15 @@ window.__ModuleLoader__.load({
       for (const name of tools) if (isToolVisible(mode, groupId, overrides, name)) visible += 1;
       if (visible === 0) return 'none';
       return visible === tools.length ? 'all' : 'partial';
+    }
+
+    /** 零工具 MCP 服务器组：开关直接写组覆盖，状态由覆盖与 mode 基线决定。 */
+    function serverGroupStateOf(mode, overrides, groupId) {
+      const groups = isObject(overrides) && isObject(overrides.groups) ? overrides.groups : {};
+      const value = groups[groupId];
+      if (value === 'on') return 'all';
+      if (value === 'off') return 'none';
+      return mode === 'allow' ? 'none' : 'all';
     }
 
     function ensureRoleEntry(draft, roleId) {
@@ -1071,6 +1094,21 @@ window.__ModuleLoader__.load({
         });
       };
 
+      // 零工具 MCP 服务器组的开关：与整组开关同一套「写覆盖 / 删覆盖」语义，
+      // 只管理该服务器在系统提示词中的 instructions 与名单条目。
+      const toggleServerGroup = (roleId, groupId) => {
+        updateDraft((current) => {
+          const entry = ensureRoleEntry(current, roleId);
+          const state = serverGroupStateOf(entry.mode, entry, groupId);
+          const desired = state === 'all' ? 'off' : 'on';
+          const baseline = entry.mode === 'allow' ? 'off' : 'on';
+          const groups = { ...entry.groups };
+          if (desired === baseline) delete groups[groupId];
+          else groups[groupId] = desired;
+          return withRole(current, roleId, { ...entry, groups });
+        });
+      };
+
       const toggleTool = (roleId, groupId, name) => {
         updateDraft((current) => {
           const entry = ensureRoleEntry(current, roleId);
@@ -1230,9 +1268,12 @@ window.__ModuleLoader__.load({
         );
         const tools = validTools(inventory.tools);
         const globalTools = validTools(Array.isArray(inventory.globalTools) ? inventory.globalTools : inventory.tools);
+        const mcpServerNames = (Array.isArray(inventory.mcpServers) ? inventory.mcpServers : [])
+          .map((item) => (isObject(item) && typeof item.name === 'string' ? item.name : ''))
+          .filter((name) => name !== '');
         const catalogForRole = (id) => draft.discovery && isObject(inventory.roleTools) && Object.prototype.hasOwnProperty.call(inventory.roleTools, id)
           ? validTools(inventory.roleTools[id]) : globalTools;
-        const makeIndex = (catalog) => buildLocalIndex(draft.sources, catalog.map((tool) => tool.name), draft.discovery, catalog);
+        const makeIndex = (catalog) => buildLocalIndex(draft.sources, catalog.map((tool) => tool.name), draft.discovery, catalog, mcpServerNames);
         const fallbackMode = draft.unlisted === 'closed' ? 'allow' : 'open';
         const roleViews = Object.create(null);
         for (const role of Array.isArray(inventory.roles) ? inventory.roles : []) {
@@ -1255,6 +1296,7 @@ window.__ModuleLoader__.load({
             index,
             mode,
             configured,
+            overrides,
             visible,
             visibleList: index.managed.filter((name) => visible.has(name)),
             hiddenList: index.managed.filter((name) => !visible.has(name)),
@@ -1529,9 +1571,16 @@ window.__ModuleLoader__.load({
             name, view.descriptions.get(name), source?.plugin, source?.module, source?.bundleTitle, source?.title,
           ].some((text) => typeof text === 'string' && text.toLowerCase().includes(query));
         });
+        // 零工具的 MCP 服务器组：按服务器提示词可见性参与筛选，而不是按工具。
+        const serverOnly = group.kind === 'mcp' && group.tools.length === 0;
+        const serverState = serverOnly && activeView !== null
+          ? serverGroupStateOf(activeView.mode, activeView.overrides, group.id)
+          : null;
+        const serverPass = serverState !== null && groupMatch
+          && (visibility === 'all' || (visibility === 'visible' ? serverState === 'all' : serverState !== 'all'));
         const open = Object.hasOwn(shownExpansion, group.id) ? shownExpansion[group.id] : filterActive;
-        return { ...group, label, provider, matchingTools, open };
-      }).filter((group) => !filterActive || group.matchingTools.length > 0);
+        return { ...group, label, provider, matchingTools, open, serverOnly, serverState, serverPass };
+      }).filter((group) => !filterActive || (group.serverOnly ? group.serverPass : group.matchingTools.length > 0));
       const matchingCount = filteredGroups.reduce((sum, group) => sum + group.matchingTools.length, 0);
       const expandableGroups = filteredGroups.filter((group) => group.matchingTools.length > 0);
       const hasCollapsedGroup = expandableGroups.some((group) => !group.open);
@@ -1539,7 +1588,9 @@ window.__ModuleLoader__.load({
       const hasManageableTools = view.index.managed.length > 0;
       const groupRows = filteredGroups.map((group) => {
         const isOpen = group.open;
-        const emptyLabel = group.match.includes('*') ? t('groupEmpty') : t('groupNoTools');
+        const emptyLabel = group.serverOnly
+          ? t('mcpPromptOnly')
+          : group.match.includes('*') ? t('groupEmpty') : t('groupNoTools');
         let detail;
         if (group.kind === 'plugin') {
           detail = group.provider?.plugin === group.label ? '' : group.provider?.plugin;
@@ -1551,15 +1602,21 @@ window.__ModuleLoader__.load({
           detail = [group.provider?.bundleTitle, ...group.match].filter(Boolean).join(' · ');
         }
         const stats = activeView !== null ? activeView.groupState[group.id] : { visible: 0, total: 0 };
-        const state = stats === undefined || stats.total === 0 ? 'none' : stats.visible === 0 ? 'none' : stats.visible === stats.total ? 'all' : 'partial';
+        // 零工具服务器组的状态来自组覆盖与 mode 基线（提示词可见性），
+        // 有工具的组仍按组内工具可见数计算。
+        const state = group.serverOnly
+          ? (group.serverState ?? 'none')
+          : stats === undefined || stats.total === 0 ? 'none' : stats.visible === 0 ? 'none' : stats.visible === stats.total ? 'all' : 'partial';
         const stateLabel =
-          stats === undefined || stats.total === 0
-            ? '—'
-            : state === 'all'
-              ? t('toolVisible')
-              : state === 'partial'
-                ? t('groupPartial')
-                : t('toolHidden');
+          group.serverOnly && group.serverState !== null
+            ? (group.serverState === 'all' ? t('toolVisible') : t('toolHidden'))
+            : stats === undefined || stats.total === 0
+              ? '—'
+              : state === 'all'
+                ? t('toolVisible')
+                : state === 'partial'
+                  ? t('groupPartial')
+                  : t('toolHidden');
         return h(
           'div',
           { key: group.id, className: 'tx-toolGroup', 'data-open': isOpen, 'data-kind': group.kind || 'custom' },
@@ -1586,7 +1643,9 @@ window.__ModuleLoader__.load({
                   { className: 'tx-groupMeta' },
                   detail ? h('span', { className: 'tx-groupSource', title: detail }, detail) : null,
                   detail ? h('span', { className: 'tx-dot' }, '·') : null,
-                  h('span', { className: 'tx-groupCount' }, fill(t('groupTools'), { count: String(group.tools.length) })),
+                  !group.serverOnly
+                    ? h('span', { className: 'tx-groupCount' }, fill(t('groupTools'), { count: String(group.tools.length) }))
+                    : null,
                   group.tools.length === 0 ? h('span', { className: 'tx-sectionMeta' }, emptyLabel) : null,
                 ),
               ),
@@ -1599,10 +1658,12 @@ window.__ModuleLoader__.load({
               h(Switch, {
                 checked: state === 'all',
                 mixed: state === 'partial',
-                disabled: locked || activeRole === null || group.tools.length === 0,
+                disabled: locked || activeRole === null || (group.tools.length === 0 && !group.serverOnly),
                 label: `${group.label} · ${activeRole === null ? '' : activeRole.displayName}`,
                 onChange: () => {
-                  if (activeRole !== null) toggleGroup(activeRole.id, group.id, group.tools);
+                  if (activeRole === null) return;
+                  if (group.serverOnly) toggleServerGroup(activeRole.id, group.id);
+                  else toggleGroup(activeRole.id, group.id, group.tools);
                 },
               }),
             ),

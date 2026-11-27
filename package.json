@@ -1,7 +1,7 @@
 {
   "name": "dsh-tool-exposure",
-  "version": "1.0.3",
-  "description": "DeepSeek Harness tool exposure by role: discover tools from actual registrations, group them by providing plugin, and keep official tools together. DSH 通用工具暴露管理：按实际注册插件自动分组，官方工具独立一组，按角色控制全局与预设继承工具。",
+  "version": "1.1.0",
+  "description": "DeepSeek Harness tool exposure by role: discover tools from actual registrations, group them by providing plugin, and keep official tools together. Hiding an MCP server also hides its system-prompt instructions and server listing. DSH 通用工具暴露管理：按实际注册插件自动分组，官方工具独立一组，按角色控制全局与预设继承工具；隐藏 MCP 服务器时同步裁剪其系统提示词说明。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -32,7 +32,7 @@
   },
   "engines": {
     "node": ">=24.9",
-    "dsh": ">=0.2.2-rc.3 <0.3.0-0"
+    "dsh": ">=0.2.2-alpha.3 <0.3.0-0"
   },
   "exports": {
     ".": "./index.js",
@@ -57,15 +57,15 @@
     "docs"
   ],
   "scripts": {
-    "test": "node test/host-policy.mjs && node test/static-checks.mjs && node test/client-smoke.mjs && node test/registry-integration.mjs"
+    "test": "node test/host-policy.mjs && node test/static-checks.mjs && node test/client-smoke.mjs && node test/registry-integration.mjs && node test/prompt-live.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.3 <0.3.0-0",
-    "@deepseek-ai/dsh-scope": ">=0.2.2-rc.3 <0.3.0-0"
+    "@deepseek-ai/dsh-tools": ">=0.2.2-alpha.3 <0.3.0-0",
+    "@deepseek-ai/dsh-scope": ">=0.2.2-alpha.3 <0.3.0-0"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
-    "@deepseek-ai/dsh-scope": "0.2.2-rc.3"
+    "@deepseek-ai/dsh-tools": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-scope": "0.2.2-alpha.3"
   },
   "dsh": {
     "bundle": {

@@ -11,6 +11,11 @@
  *     自动发现的白名单使用 allow 掩码，覆盖尚未注册的继承工具。
  *   - restrict 要求提供 allow 或 deny，且不能传未知或本作用域注册的工具名。
  *     这里只下发已注册的继承工具名，并跳过空 deny 列表。
+ *   - MCP 除了工具还会往系统提示词注入服务器名单（mcp-resource-servers）与
+ *     每服务器 instructions（mcp:<server>），restrict 不影响它们。这里为每个
+ *     agent 注册作用域 system-prompt/assemble 监听器，按同一套组策略裁剪：
+ *     组关闭（或组内工具全部隐藏）时，该服务器的提示词与名单条目一并消失；
+ *     没有可见资源工具或服务器时整节删除。零工具服务器同样成组可管理。
  *
  * Client 半（client.js）在 Settings 里渲染矩阵页，通过本文件注册的同源路由读写：
  *   GET  {prefix}/ping
@@ -22,7 +27,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { providerGroup } from './providers.js';
+import { MCP_SERVER_NAME, providerGroup } from './providers.js';
 
 const TAG = '[dsh-tool-exposure]';
 
@@ -40,6 +45,31 @@ const APPLIED = Symbol.for('dsh-tool-exposure.applied');
 const POLICY_SNAPSHOT = Symbol.for('dsh-tool-exposure.policy-snapshot');
 const STARTED = Symbol.for('dsh-tool-exposure.started');
 const LEGACY = Symbol.for('dsh-tool-exposure.legacy');
+/** 提示词过滤器（system-prompt/assemble 作用域监听器）的清理函数。 */
+const PROMPT_FILTER = Symbol.for('dsh-tool-exposure.prompt-filter');
+/** waterfall 过滤时读取的当次策略视图（mode + 工具可见集 + 服务器提示词可见性）。 */
+const POLICY_VIEW = Symbol.for('dsh-tool-exposure.policy-view');
+
+/* ------------------------------------------------------------------ */
+/* MCP 提示词常量（与 @deepseek-ai/dsh-mcp-resources / dsh-mcp-client 对齐） */
+/* ------------------------------------------------------------------ */
+
+/** dsh-mcp-resources 注册的服务器名单 section 名。 */
+const RESOURCE_SECTION = 'mcp-resource-servers';
+/** 名单 section 的正文标题；上游改名时作为文本兜底识别。 */
+const RESOURCE_SECTION_HEADING = '## MCP resource servers';
+/** dsh-mcp-client 按服务器注册的 instructions section：mcp:<server>。 */
+const MCP_SECTION = /^mcp:([A-Za-z0-9_-]{1,32})$/;
+/** 名单 section 中点名的三个共享资源工具（官方包注册，工具级可隐藏）。 */
+const RESOURCE_TOOLS = ['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource'];
+
+/** 复刻 dsh-mcp-resources 的名单文本；全部可见时与上游逐字节一致。 */
+function resourceSectionText(toolNames, serverNames) {
+  const mention = toolNames.length === 1
+    ? toolNames[0]
+    : `${toolNames.slice(0, -1).join(', ')}, or ${toolNames[toolNames.length - 1]}`;
+  return `## MCP resource servers\n\nUse ${mention} with one of these names as the server argument: ${JSON.stringify(serverNames)}.`;
+}
 
 /** 保存请求体上限（矩阵配置本身很小，防御异常大包）。 */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -258,10 +288,55 @@ function toolCatalogOf(tools, agent = null) {
 }
 
 /**
+ * 发现配置过的 MCP 服务器名单（包含没有任何工具、只提供 instructions/资源的服务器）。
+ *
+ * 来源：mcpManager.list()（Settings 管理的服务器）、configEditor 里的直接
+ * dsh-mcp-client 配置行、以及工具目录 provider.mcpServer。三处都只是内存读取；
+ * 任一来源失败只降级（少发现几个组），不影响策略本身。
+ */
+function discoverMcpServers(ctx, catalogs = []) {
+  const names = new Set();
+  for (const catalog of catalogs) {
+    if (!Array.isArray(catalog)) continue;
+    for (const tool of catalog) {
+      const server = tool && typeof tool === 'object' ? tool.provider?.mcpServer : undefined;
+      if (typeof server === 'string' && MCP_SERVER_NAME.test(server)) names.add(server);
+    }
+  }
+  const manager = optionalService(ctx, 'mcpManager');
+  if (manager && typeof manager.list === 'function') {
+    try {
+      for (const row of manager.list() || []) {
+        if (isObject(row) && typeof row.name === 'string' && MCP_SERVER_NAME.test(row.name)) names.add(row.name);
+      }
+    } catch (error) {
+      console.warn(`${TAG} mcpManager.list() failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const editor = optionalService(ctx, 'configEditor');
+  if (editor && typeof editor.entries === 'function') {
+    try {
+      for (const entry of editor.entries() || []) {
+        const options = entry && typeof entry === 'object' ? entry.options : undefined;
+        if (options?.name !== '@deepseek-ai/dsh-mcp-client') continue;
+        const server = options?.config?.serverName;
+        if (typeof server === 'string' && MCP_SERVER_NAME.test(server)) names.add(server);
+      }
+    } catch (error) {
+      console.warn(`${TAG} configEditor.entries() failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return [...names].sort();
+}
+
+/**
  * 全局 MCP 按服务器归组，其余官方工具归在一起。其他工具优先匹配自定义组。
  * 关闭 discovery 时只使用自定义 sources 的第一个匹配组。
+ *
+ * @param {string[]} servers 已配置但可能没有工具的 MCP 服务器名；
+ *   自动发现模式下为它们建立零工具组，用来管理 instructions/资源提示词。
  */
-function buildToolIndex(config, names, catalog = []) {
+function buildToolIndex(config, names, catalog = [], servers = []) {
   const groups = [];
   for (const [id, source] of Object.entries(config.sources)) {
     groups.push({
@@ -302,6 +377,16 @@ function buildToolIndex(config, names, catalog = []) {
     }
   }
   const rank = { official: 0, mcp: 1, plugin: 2, unknown: 3 };
+  // 没有工具的服务器也要成组：组的开关同时管理它在系统提示词里的
+  // instructions section 与服务器名单中的出现。
+  if (config.discovery) {
+    for (const server of servers) {
+      if (typeof server !== 'string' || !MCP_SERVER_NAME.test(server)) continue;
+      const id = `@mcp/${server}`;
+      if (automatic.has(id)) continue;
+      automaticGroup({ id, label: server, kind: 'mcp' });
+    }
+  }
   const discovered = [...automatic.values()].sort((left, right) =>
     rank[left.kind] - rank[right.kind] || left.label.localeCompare(right.label));
   groups.unshift(...discovered.filter(prioritized));
@@ -320,6 +405,10 @@ function roleEntryOf(config, roleId) {
  * 解析一个角色的有效暴露面。
  * 基线：mode=open 全给 / mode=allow 全不给；未配置的角色走 unlisted。
  * 覆盖：groups 次之，tools（单工具例外）最后生效。
+ *
+ * serverPrompts：每个 MCP 服务器在系统提示词中的可见性（instructions section
+ * 与服务器名单）。规则：组开关（含 mode 基线）决定基础值；组内有工具时至少
+ * 要有一个工具可见，全部工具被单独关闭时提示词一并隐藏。
  */
 function resolveRolePolicy(config, roleId, index) {
   const entry = roleEntryOf(config, roleId);
@@ -328,6 +417,7 @@ function resolveRolePolicy(config, roleId, index) {
   const groupOverrides = entry === null ? {} : entry.groups;
   const toolOverrides = entry === null ? {} : entry.tools;
   const visible = new Set();
+  const visiblePerGroup = new Map();
   for (const name of index.managed) {
     const groupId = index.owner.get(name);
     let isVisible = mode !== 'allow';
@@ -337,11 +427,26 @@ function resolveRolePolicy(config, roleId, index) {
     const toolValue = toolOverrides[name];
     if (toolValue === 'on') isVisible = true;
     else if (toolValue === 'off') isVisible = false;
-    if (isVisible) visible.add(name);
+    if (isVisible) {
+      visible.add(name);
+      visiblePerGroup.set(groupId, (visiblePerGroup.get(groupId) ?? 0) + 1);
+    }
   }
   const hidden = new Set();
   for (const name of index.managed) if (!visible.has(name)) hidden.add(name);
-  return { mode, configured: entry !== null, visible, hidden };
+  const serverPrompts = new Map();
+  for (const group of index.groups) {
+    if (group.kind !== 'mcp' || typeof group.id !== 'string' || !group.id.startsWith('@mcp/')) continue;
+    const server = group.id.slice(5);
+    if (!MCP_SERVER_NAME.test(server)) continue;
+    let groupVisible = mode !== 'allow';
+    const groupValue = groupOverrides[group.id];
+    if (groupValue === 'on') groupVisible = true;
+    else if (groupValue === 'off') groupVisible = false;
+    if (group.tools.length > 0 && (visiblePerGroup.get(group.id) ?? 0) === 0) groupVisible = false;
+    serverPrompts.set(server, groupVisible);
+  }
+  return { mode, configured: entry !== null, visible, hidden, serverPrompts };
 }
 
 /* ------------------------------------------------------------------ */
@@ -376,6 +481,143 @@ function attachRestriction(ctx, agent, tools, filter) {
   return dispose;
 }
 
+/* ------------------------------------------------------------------ */
+/* MCP 提示词过滤（system-prompt/assemble 作用域 waterfall）            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * DSH 把 MCP 的服务器名单（mcp-resource-servers section）和每个服务器的
+ * instructions（mcp:<server> section）直接写进系统提示词，不受 tools.restrict()
+ * 影响。这里按 agent 注册作用域监听器，在组装后的 presentation 上把这些
+ * section 按角色策略裁掉：工具隐藏了，提示词也就不再污染上下文。
+ */
+
+/** 策略视图里单个工具的最终可见性（含未受管工具的 mode 回退）。 */
+function toolVisibleInView(view, name) {
+  if (typeof name !== 'string') return false;
+  if (view.visible.has(name)) return true;
+  if (view.hidden.has(name)) return false;
+  return view.mode !== 'allow';
+}
+
+/** 策略视图里单个服务器的提示词可见性（未成组的服务器按 mode 回退）。 */
+function serverVisibleInView(view, server) {
+  if (typeof server !== 'string') return false;
+  const state = view.serverPrompts.get(server);
+  return state === undefined ? view.mode !== 'allow' : state;
+}
+
+/**
+ * 重写服务器名单 section 的文本：剔除隐藏的服务器名，只点名可见的资源工具。
+ * 返回原文本表示无需改动（保持 KV cache 逐字节一致）；null 表示整节删除。
+ */
+function rebuildResourceSection(text, view) {
+  if (typeof text !== 'string' || text === '') return text;
+  const visibleTools = RESOURCE_TOOLS.filter((name) => toolVisibleInView(view, name));
+  if (visibleTools.length === 0) return null;
+  const listing = / as the server argument: (\[.*\])\.$/.exec(text);
+  if (listing === null) return text;
+  let names;
+  try {
+    names = JSON.parse(listing[1]);
+  } catch {
+    return text;
+  }
+  if (!Array.isArray(names)) return text;
+  const filtered = names.filter((name) => typeof name === 'string' && serverVisibleInView(view, name)).sort();
+  if (filtered.length === 0) return null;
+  if (filtered.length === names.length && visibleTools.length === RESOURCE_TOOLS.length) return text;
+  return resourceSectionText(visibleTools, filtered);
+}
+
+/**
+ * 裁剪一次组装结果中的 MCP section。只读不改输入对象；没有变化时原样返回。
+ * 过滤失败按宿主原样放行（fail-open），不让提示词裁剪拖垮请求。
+ */
+function filterMcpPresentation(assembly, view) {
+  if (view === null || typeof view !== 'object' || !isObject(assembly) || !Array.isArray(assembly.sections)) {
+    return assembly;
+  }
+  let changed = false;
+  const sections = [];
+  for (const section of assembly.sections) {
+    if (!isObject(section)) {
+      sections.push(section);
+      continue;
+    }
+    const name = typeof section.name === 'string' ? section.name : '';
+    const isResource = name === RESOURCE_SECTION
+      || (typeof section.text === 'string' && section.text.startsWith(RESOURCE_SECTION_HEADING));
+    if (isResource) {
+      const text = rebuildResourceSection(section.text, view);
+      if (text === section.text) {
+        sections.push(section);
+        continue;
+      }
+      changed = true;
+      if (text !== null) sections.push({ ...section, text });
+      continue;
+    }
+    const server = MCP_SECTION.exec(name);
+    if (server !== null && !serverVisibleInView(view, server[1])) {
+      changed = true;
+      continue;
+    }
+    sections.push(section);
+  }
+  return changed ? { ...assembly, sections } : assembly;
+}
+
+/**
+ * 为一个 agent 注册作用域内的 system-prompt/assemble 监听器。
+ *
+ * 通过 agent.ctx 注册（Cordis 的 traceable 绑定让监听器带上 agent 作用域
+ * 标签），宿主只会把该作用域（含子代理）的组装事件派发给它。已注册时直接
+ * 复用；agent.ctx.on 不可用（测试桩）时静默跳过。
+ */
+function attachAgentPromptFilter(ctx, agent) {
+  if (agent === null || typeof agent !== 'object') return null;
+  const existing = readAgentState(agent, PROMPT_FILTER);
+  if (existing !== undefined) return existing;
+  const agentCtx = agent.ctx;
+  if (typeof agentCtx?.on !== 'function') return null;
+  const listener = async (assembly, context, next) => {
+    const result = await next();
+    const view = readAgentState(agent, POLICY_VIEW);
+    if (view === undefined) return result;
+    try {
+      return filterMcpPresentation(result, view);
+    } catch (error) {
+      console.warn(`${TAG} prompt filter failed: ${error instanceof Error ? error.message : String(error)}`);
+      return result;
+    }
+  };
+  let off;
+  try {
+    off = agentCtx.on('system-prompt/assemble', listener);
+  } catch (error) {
+    console.warn(`${TAG} prompt filter registration failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+  let dispose;
+  try {
+    dispose = ctx.effect(() => () => {
+      if (readAgentState(agent, PROMPT_FILTER)?.dispose === dispose) setAgentState(agent, PROMPT_FILTER, undefined);
+      return off();
+    }, 'tool-exposure: release agent prompt filter');
+  } catch (error) {
+    try {
+      off();
+    } catch {
+      /* 注册环境已失效 */
+    }
+    throw error;
+  }
+  const record = { dispose };
+  setAgentState(agent, PROMPT_FILTER, record);
+  return record;
+}
+
 /** 显式 force 使用当前配置替换会话快照。角色和继承工具始终读取当前绑定。 */
 function applyAgentPolicy(ctx, agent, config, options = {}) {
   if (!agent || typeof agent !== 'object') return false;
@@ -403,8 +645,17 @@ function applyAgentPolicy(ctx, agent, config, options = {}) {
   const catalog = toolCatalogOf(tools, snapshot.config.discovery ? agent : null);
   if (catalog === null) throw new Error('Unable to read the agent tool catalog');
   const names = catalog.map((tool) => tool.name);
-  const index = buildToolIndex(snapshot.config, names, catalog);
+  const servers = discoverMcpServers(ctx, [catalog]);
+  const index = buildToolIndex(snapshot.config, names, catalog, servers);
   const policy = resolveRolePolicy(snapshot.config, roleId, index);
+  // 提示词过滤器读取的当次视图：mode、工具可见集与服务器提示词可见性。
+  setAgentState(agent, POLICY_VIEW, {
+    mode: policy.mode,
+    visible: policy.visible,
+    hidden: policy.hidden,
+    serverPrompts: policy.serverPrompts,
+  });
+  attachAgentPromptFilter(ctx, agent);
   const deny = [...policy.hidden];
   // 自动发现覆盖所有继承工具。用 allow 让晚注册的工具在重算前保持隐藏。
   // 手工分组保留未匹配工具的宿主可见性，继续使用 deny。
@@ -468,10 +719,20 @@ function liftAllRestrictions(ctx) {
         /* 已随作用域消失 */
       }
     }
+    // 提示词过滤器一并解除：会话回到宿主默认的系统提示词。
+    const filter = readAgentState(agent, PROMPT_FILTER);
+    if (filter && typeof filter.dispose === 'function') {
+      try {
+        filter.dispose();
+      } catch {
+        /* 已随作用域消失 */
+      }
+    }
     // 清除会话快照，后续工具注册保留解除状态。
     setAgentState(agent, LEGACY, true);
     setAgentState(agent, POLICY_SNAPSHOT, undefined);
     setAgentState(agent, APPLIED, undefined);
+    setAgentState(agent, POLICY_VIEW, undefined);
   }
   return lifted;
 }
@@ -608,11 +869,14 @@ async function buildInventory(ctx, config) {
     for (const tool of catalog) if (!RESERVED_TOOL_NAMES.has(tool.name)) allTools.set(tool.name, tool);
   }
   const catalog = (config.discovery ? [...allTools.values()] : globalCatalog || []).filter((tool) => !RESERVED_TOOL_NAMES.has(tool.name));
-  const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
-  const globalIndex = buildToolIndex(config, (globalCatalog || []).map((tool) => tool.name), globalCatalog || []);
+  // 服务器名单也覆盖没有工具、只提供 instructions/资源的 MCP 服务器，
+  // 三个索引共用同一份发现结果，保证矩阵与运行时策略一致。
+  const serverNames = discoverMcpServers(ctx, [catalog, ...roleCatalogs.values()]);
+  const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog, serverNames);
+  const globalIndex = buildToolIndex(config, (globalCatalog || []).map((tool) => tool.name), globalCatalog || [], serverNames);
   const roleIndexes = new Map(roles.map((role) => {
     const items = config.discovery ? roleCatalogs.get(role.id) : globalCatalog || [];
-    return [role.id, buildToolIndex(config, items.map((tool) => tool.name), items)];
+    return [role.id, buildToolIndex(config, items.map((tool) => tool.name), items, serverNames)];
   }));
   const groupMatches = new Map();
   for (const candidate of [globalIndex, ...roleIndexes.values()]) {
@@ -712,6 +976,10 @@ async function buildInventory(ctx, config) {
     configVersion: configVersion(config),
     discovery: config.discovery,
     unlisted: config.unlisted,
+    mcpServers: serverNames.map((name) => ({
+      name,
+      toolCount: index.groups.find((group) => group.id === `@mcp/${name}`)?.tools.length ?? 0,
+    })),
     sources: index.groups.filter((group) => !group.automatic).map((group) => ({
       id: group.id,
       label: group.label,
@@ -744,7 +1012,8 @@ async function buildEffective(ctx, config, roleId) {
   if (config.discovery && known && presets && typeof tools.presetToolCatalog === 'function') {
     catalog = await tools.presetToolCatalog(presets, role);
   }
-  const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog);
+  const serverNames = discoverMcpServers(ctx, [catalog]);
+  const index = buildToolIndex(config, catalog.map((tool) => tool.name), catalog, serverNames);
   const policy = resolveRolePolicy(config, role, index);
   return {
     ok: true,
@@ -755,6 +1024,8 @@ async function buildEffective(ctx, config, roleId) {
     managed: index.managed.length,
     visible: [...policy.visible].sort(),
     hidden: [...policy.hidden].sort(),
+    // 每个已发现 MCP 服务器的提示词可见性（instructions + 服务器名单）。
+    servers: [...serverNames].map((name) => ({ name, visible: serverVisibleInView(policy, name) })),
   };
 }
 
@@ -1020,11 +1291,13 @@ function createRouteHandler(ctx, config) {
           } catch {
             /* The agent scope may already have been disposed. */
           }
-          const index = buildToolIndex(agentConfig, catalog.map((tool) => tool.name), catalog);
+          const servers = discoverMcpServers(ctx, [catalog]);
+          const index = buildToolIndex(agentConfig, catalog.map((tool) => tool.name), catalog, servers);
           const roleId = roleOfAgent(ctx, agent);
           const policy = resolveRolePolicy(agentConfig, roleId, index);
           const deny = [...policy.hidden].filter((name) => index.registered.has(name));
           const applied = readAgentState(agent, APPLIED);
+          const view = readAgentState(agent, POLICY_VIEW);
           rows.push({
             id: String(agent.id),
             role: roleId,
@@ -1032,6 +1305,8 @@ function createRouteHandler(ctx, config) {
             managed: index.managed.length,
             denyCount: deny.length,
             applied: applied ? applied.signature : null,
+            promptFilter: readAgentState(agent, PROMPT_FILTER) !== undefined,
+            promptHiddenServers: view ? [...view.serverPrompts.entries()].filter(([, visible]) => visible === false).map(([name]) => name).sort() : [],
             started: readAgentState(agent, STARTED) === true,
             legacy: readAgentState(agent, LEGACY) === true,
           });
@@ -1143,10 +1418,18 @@ export function apply(ctx, rawConfig) {
   ctx.on('agent/disposed', (payload) => {
     const agent = payload && payload.agent;
     const applied = readAgentState(agent, APPLIED);
+    const filter = readAgentState(agent, PROMPT_FILTER);
     if (agent) AGENT_STATE.delete(agent);
     if (applied && typeof applied.dispose === 'function') {
       try {
         applied.dispose();
+      } catch {
+        /* agent 作用域已释放 */
+      }
+    }
+    if (filter && typeof filter.dispose === 'function') {
+      try {
+        filter.dispose();
       } catch {
         /* agent 作用域已释放 */
       }
@@ -1200,12 +1483,18 @@ export const __test = {
   ROUTE_PREFIX,
   APPLIED,
   LEGACY,
+  PROMPT_FILTER,
+  POLICY_VIEW,
   STARTED,
   applyAgentPolicy,
+  attachAgentPromptFilter,
   buildEffective,
   createRouteHandler,
   buildInventory,
   buildToolIndex,
+  discoverMcpServers,
+  filterMcpPresentation,
+  rebuildResourceSection,
   globToRegExp,
   globalToolNames,
   liftAllRestrictions,
@@ -1213,10 +1502,12 @@ export const __test = {
   markLiveAgentsLegacy,
   mountRoutes,
   normalizeMatchList,
+  serverVisibleInView,
   setAgentState,
   normalizeConfig,
   normalizeDraft,
   readAgentState,
   refreshAgentPolicies,
   resolveRolePolicy,
+  toolVisibleInView,
 };

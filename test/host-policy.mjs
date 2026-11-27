@@ -1025,6 +1025,237 @@ check('apply(): event wiring (created/tool-resolution/claimed/disposed/tools-cha
   eq(agent.ctx.restrictions.length, 0, 'disposed releases restriction');
 });
 
+/* --------------------- MCP 提示词同步隐藏（新增） --------------------- */
+
+const MCP_CATALOG = [
+  { name: 'read', provider: { plugin: '@deepseek-ai/dsh-tool-files', official: true } },
+  { name: 'mcp__ida__decompile', provider: { plugin: '@deepseek-ai/dsh-mcp-client', official: true, mcpServer: 'ida' } },
+];
+const UPSTREAM_RESOURCE_TEXT = '## MCP resource servers\n\n'
+  + 'Use list_mcp_resources, list_mcp_resource_templates, or read_mcp_resource with one of these names '
+  + 'as the server argument: ["ida","yakit"].';
+
+check('buildToolIndex: 零工具 MCP 服务器也成组（discovery）', () => {
+  const config = T.normalizeConfig({ discovery: true, sources: {}, roles: {} });
+  const names = ['read', 'mcp__ida__decompile'];
+  const index = T.buildToolIndex(config, names, MCP_CATALOG, ['yakit', 'ida']);
+  const ids = index.groups.map((group) => group.id);
+  ok(ids.includes('@mcp/ida'), 'tool-backed ida group');
+  ok(ids.includes('@mcp/yakit'), 'zero-tool yakit group');
+  eq(index.groups.find((group) => group.id === '@mcp/ida').tools, ['mcp__ida__decompile'], 'ida owns its tool');
+  eq(index.groups.find((group) => group.id === '@mcp/yakit').tools, [], 'yakit owns no tool');
+  const manual = T.buildToolIndex({ ...config, discovery: false }, names, MCP_CATALOG, ['yakit']);
+  ok(!manual.groups.some((group) => group.id === '@mcp/yakit'), 'manual mode keeps automatic servers out');
+});
+
+check('resolveRolePolicy: serverPrompts 按组覆盖、工具可见性与 mode 计算', () => {
+  const config = T.normalizeConfig({
+    discovery: true,
+    roles: {
+      off: { mode: 'open', groups: { '@mcp/ida': 'off', '@mcp/yakit': 'off' } },
+      keep: { mode: 'open', groups: {} },
+      toolsOff: { mode: 'open', groups: { '@mcp/ida': 'on' }, tools: { mcp__ida__decompile: 'off' } },
+      allow: { mode: 'allow', groups: { '@mcp/yakit': 'on' } },
+    },
+  });
+  const index = T.buildToolIndex(config, ['read', 'mcp__ida__decompile'], MCP_CATALOG, ['yakit', 'ida']);
+  const entries = (policy) => Object.fromEntries([...policy.serverPrompts.entries()]);
+  eq(entries(T.resolveRolePolicy(config, 'off', index)), { ida: false, yakit: false }, 'off role hides both servers');
+  eq(entries(T.resolveRolePolicy(config, 'keep', index)), { ida: true, yakit: true }, 'open baseline keeps both');
+  eq(entries(T.resolveRolePolicy(config, 'toolsOff', index)), { ida: false, yakit: true }, '组开着但工具全关时提示词也隐藏');
+  eq(entries(T.resolveRolePolicy(config, 'allow', index)), { ida: false, yakit: true }, 'allow 白名单只放行显式开启的服务器');
+});
+
+check('discoverMcpServers: manager、config 行与工具目录三来源合并', () => {
+  const ctx = {
+    get(name) {
+      if (name === 'mcpManager') return { list: () => [{ name: 'managed' }, { name: 'bad name!' }, 'not-a-row'] };
+      if (name === 'configEditor') return {
+        entries: () => [
+          { options: { id: 'mcp-ida', name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'ida' } } },
+          { options: { id: 'other', name: '@deepseek-ai/dsh-web', config: {} } },
+          { options: { id: 'no-name', name: '@deepseek-ai/dsh-mcp-client', config: {} } },
+        ],
+      };
+      return undefined;
+    },
+  };
+  const catalogs = [[{ name: 'x', provider: { mcpServer: 'from-tools' } }]];
+  eq(T.discoverMcpServers(ctx, catalogs), ['from-tools', 'ida', 'managed'], 'merged, validated, sorted');
+  eq(T.discoverMcpServers({ get: () => undefined }, []), [], 'no sources means no servers');
+});
+
+function makeView(overrides = {}) {
+  return {
+    mode: overrides.mode ?? 'open',
+    visible: new Set(overrides.visible ?? []),
+    hidden: new Set(overrides.hidden ?? []),
+    serverPrompts: new Map(overrides.servers ?? []),
+  };
+}
+
+check('rebuildResourceSection: 无需变化时逐字节保留上游文本', () => {
+  const view = makeView({ servers: [['ida', true], ['yakit', true]] });
+  eq(T.rebuildResourceSection(UPSTREAM_RESOURCE_TEXT, view), UPSTREAM_RESOURCE_TEXT, 'byte-identical');
+});
+
+check('rebuildResourceSection: 隐藏部分服务器后重写名单', () => {
+  const view = makeView({ servers: [['ida', true], ['yakit', false]] });
+  eq(
+    T.rebuildResourceSection(UPSTREAM_RESOURCE_TEXT, view),
+    '## MCP resource servers\n\nUse list_mcp_resources, list_mcp_resource_templates, or read_mcp_resource with one of these names as the server argument: ["ida"].',
+    'yakit dropped from the listing',
+  );
+});
+
+check('rebuildResourceSection: 服务器全隐藏或资源工具不可见时删除整节', () => {
+  eq(T.rebuildResourceSection(UPSTREAM_RESOURCE_TEXT, makeView({ servers: [['ida', false], ['yakit', false]] })), null, 'no visible server');
+  const hidden = makeView({
+    visible: ['read'],
+    hidden: ['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource'],
+    servers: [['ida', true]],
+  });
+  eq(T.rebuildResourceSection(UPSTREAM_RESOURCE_TEXT, hidden), null, 'resource tools hidden');
+});
+
+check('rebuildResourceSection: 部分资源工具隐藏时只点名可见工具', () => {
+  const view = makeView({
+    visible: ['read', 'read_mcp_resource'],
+    hidden: ['list_mcp_resources', 'list_mcp_resource_templates'],
+    servers: [['ida', true], ['yakit', true]],
+  });
+  eq(
+    T.rebuildResourceSection(UPSTREAM_RESOURCE_TEXT, view),
+    '## MCP resource servers\n\nUse read_mcp_resource with one of these names as the server argument: ["ida","yakit"].',
+    'single tool mention with both servers kept',
+  );
+});
+
+check('rebuildResourceSection: 未识别格式原样放行', () => {
+  eq(T.rebuildResourceSection('some other section text', makeView()), 'some other section text', 'unknown text passthrough');
+  eq(T.rebuildResourceSection('', makeView()), '', 'empty stays empty');
+});
+
+check('filterMcpPresentation: 按服务器裁剪 section，其余不动，输入不被修改', () => {
+  const view = makeView({ servers: [['ida', false], ['yakit', true]] });
+  const assembly = {
+    sections: [
+      { name: 'harness:identity', text: 'You are an AI agent.' },
+      { name: 'mcp-resource-servers', interpolate: false, text: UPSTREAM_RESOURCE_TEXT },
+      { name: 'mcp:ida', interpolate: false, text: '### MCP server: ida\n\nIDA.' },
+      { name: 'mcp:yakit', interpolate: false, text: '### MCP server: yakit\n\nYakit.' },
+    ],
+  };
+  const filtered = T.filterMcpPresentation(assembly, view);
+  eq(filtered.sections.map((section) => section.name), ['harness:identity', 'mcp-resource-servers', 'mcp:yakit'], 'ida section dropped');
+  ok(filtered.sections[1].text.endsWith('["yakit"].'), 'ida removed from the listing, yakit kept');
+  eq(filtered.sections[1].interpolate, false, 'interpolate flag preserved');
+  eq(assembly.sections.length, 4, 'input assembly untouched');
+});
+
+check('filterMcpPresentation: 无变化时原样返回同一对象', () => {
+  const assembly = { sections: [{ name: 'mcp-resource-servers', text: UPSTREAM_RESOURCE_TEXT }] };
+  const view = makeView({ servers: [['ida', true], ['yakit', true]] });
+  ok(T.filterMcpPresentation(assembly, view) === assembly, 'same reference when nothing changes');
+});
+
+check('filterMcpPresentation: allow 模式下未成组服务器也隐藏，open 模式保留', () => {
+  const allowView = makeView({ mode: 'allow', visible: ['read'] });
+  const assembly = { sections: [{ name: 'mcp:unknown', text: 'x' }, { name: 'keep', text: 'y' }] };
+  eq(T.filterMcpPresentation(assembly, allowView).sections.map((section) => section.name), ['keep'], 'unknown hidden in allow mode');
+  const openView = makeView({ mode: 'open' });
+  eq(T.filterMcpPresentation(assembly, openView).sections.length, 2, 'unknown kept in open mode');
+});
+
+function makePromptAgent(roleId) {
+  const agent = makeAgent(roleId);
+  const registered = [];
+  agent.ctx.on = (event, listener) => {
+    registered.push({ event, listener });
+    return () => {
+      const at = registered.findIndex((entry) => entry.listener === listener);
+      if (at >= 0) registered.splice(at, 1);
+    };
+  };
+  agent.__listeners = registered;
+  return agent;
+}
+
+const MCP_APPLY_CONFIG = T.normalizeConfig({
+  discovery: true,
+  roles: { standard: { mode: 'open', groups: { '@mcp/ida': 'off', '@mcp/yakit': 'off' } } },
+});
+
+const promptAgent = makePromptAgent('standard');
+promptAgent.ctx.tools.agentToolCatalog = () => MCP_CATALOG;
+const promptBaseCtx = makePluginCtx([promptAgent]);
+const promptCtx = {
+  ...promptBaseCtx,
+  get(name) {
+    if (name === 'mcpManager') return { list: () => [{ name: 'yakit' }] };
+    return promptBaseCtx.get(name);
+  },
+};
+T.applyAgentPolicy(promptCtx, promptAgent, MCP_APPLY_CONFIG);
+T.applyAgentPolicy(promptCtx, promptAgent, MCP_APPLY_CONFIG);
+const promptListener = promptAgent.__listeners[0]?.listener;
+const promptAssembly = {
+  sections: [
+    { name: 'harness:identity', text: 'You are an AI agent.' },
+    { name: 'mcp-resource-servers', interpolate: false, text: UPSTREAM_RESOURCE_TEXT },
+    { name: 'mcp:ida', interpolate: false, text: '### MCP server: ida\n\nIDA.' },
+    { name: 'mcp:yakit', interpolate: false, text: '### MCP server: yakit\n\nYakit.' },
+  ],
+};
+const promptFiltered = typeof promptListener === 'function'
+  ? await promptListener(promptAssembly, {}, async () => promptAssembly)
+  : null;
+check('applyAgentPolicy: 记录提示词视图并注册一次作用域监听器', () => {
+  const view = T.readAgentState(promptAgent, T.POLICY_VIEW);
+  ok(view !== undefined, 'policy view stored');
+  eq(view.mode, 'open', 'view mode');
+  eq([...view.serverPrompts.keys()].sort(), ['ida', 'yakit'], 'view tracks servers');
+  eq(promptAgent.__listeners.map((entry) => entry.event), ['system-prompt/assemble'], 'one scoped listener despite two applies');
+  ok(promptFiltered !== null, 'listener produced a result');
+});
+check('applyAgentPolicy: waterfall 监听器按角色裁剪 MCP 提示词', () => {
+  eq(promptFiltered.sections.map((section) => section.name), ['harness:identity'], 'MCP sections dropped entirely');
+  eq(promptAssembly.sections.length, 4, 'input assembly untouched');
+});
+
+T.liftAllRestrictions(promptCtx);
+check('liftAllRestrictions: 同时解除提示词监听器并清空视图', () => {
+  eq(promptAgent.__listeners.length, 0, 'listener removed');
+  eq(T.readAgentState(promptAgent, T.POLICY_VIEW), undefined, 'view cleared');
+});
+T.applyAgentPolicy(promptCtx, promptAgent, MCP_APPLY_CONFIG);
+check('applyAgentPolicy: 解除后的会话保持解除（legacy 语义）', () => {
+  eq(promptAgent.__listeners.length, 0, 'lifted agent stays lifted');
+});
+
+const effectiveServersCtx = {
+  tools: {
+    schemas: () => SCHEMAS,
+    get: (name) => SCHEMAS.find((schema) => schema.name === name),
+  },
+  get(name) {
+    if (name === 'agentPresets') return { list: async () => [{ id: 'standard', name: 'Standard' }] };
+    if (name === 'mcpManager') return { list: () => [{ name: 'ida' }, { name: 'yakit' }] };
+    return undefined;
+  },
+};
+const effectiveServers = await T.buildEffective(
+  effectiveServersCtx,
+  T.normalizeConfig({ roles: { standard: { mode: 'open', groups: { '@mcp/ida': 'off' } } } }),
+  'standard',
+);
+check('buildEffective: 报告每个 MCP 服务器的提示词可见性', () => {
+  eq(effectiveServers.servers, [
+    { name: 'ida', visible: false },
+    { name: 'yakit', visible: true },
+  ], 'per-server prompt visibility');
+});
+
 /* ------------------------------- result -------------------------------- */
 
 console.log('---');

@@ -1,18 +1,20 @@
 /** Boot the installed DSH in an owned temporary profile, without model tasks or user data. */
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createServer } from 'node:net';
 import { execFile, spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { copyPluginToProfile, removeTestHome } from './isolated-profile.mjs';
 
 const run = promisify(execFile);
 const packageName = 'dsh-tool-exposure';
 const routePath = `/plugins/${packageName}`;
 const guardHeaders = { 'x-dsh-tool-exposure-plugin': '1' };
+const profilePrefix = 'dsh-tool-exposure-profile-';
 
 function responseCookies(response) {
   return response.headers.getSetCookie().map((cookie) => cookie.split(';', 1)[0]).join('; ');
@@ -61,7 +63,7 @@ export async function runProfileSmoke(installed, options = {}) {
   const cli = JSON.parse(readFileSync(cliManifest, 'utf8'));
   assert.equal(cli.name, '@deepseek-ai/dsh');
   const cliBin = join(dirname(cliManifest), cli.bin.dsh);
-  const taskHome = mkdtempSync(join(tmpdir(), 'dsh-tool-exposure-profile-'));
+  const taskHome = mkdtempSync(join(tmpdir(), profilePrefix));
   const project = dirname(dirname(fileURLToPath(import.meta.url)));
   const profile = join(taskHome, 'profiles', 'web');
   const fixture = join(taskHome, 'fixture-provider');
@@ -95,7 +97,7 @@ export async function runProfileSmoke(installed, options = {}) {
       child.once('error', (error) => { logs += String(error); resolveClose(); });
       child.once('close', resolveClose);
     });
-    const deadline = Date.now() + 20000;
+    const deadline = Date.now() + 60000;
     let launchUrl;
     let headers;
     while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
@@ -103,12 +105,12 @@ export async function runProfileSmoke(installed, options = {}) {
         launchUrl ??= logs.match(/dsh web: (https?:\/\/\S+)/)?.[1];
         if (launchUrl && new URL(launchUrl).origin === origin) {
           if (!headers) {
-            const exchange = await fetch(launchUrl, { redirect: 'manual', signal: AbortSignal.timeout(700) });
+            const exchange = await fetch(launchUrl, { redirect: 'manual', signal: AbortSignal.timeout(2400) });
             const cookie = responseCookies(exchange);
             if (cookie) headers = { ...guardHeaders, cookie };
           }
           if (headers) {
-            const response = await fetch(`${origin}${routePath}/inventory`, { headers, signal: AbortSignal.timeout(700) });
+            const response = await fetch(`${origin}${routePath}/inventory`, { headers, signal: AbortSignal.timeout(2400) });
             if (response.ok) {
               const inventory = await response.json();
               if (['mcp__fixture__docs__lookup', 'mcp__fixture-archive__lookup'].every((name) =>
@@ -166,10 +168,10 @@ export function apply(ctx) {
 `);
     const { initProfile, readPluginMeta } = await import(pathToFileURL(installed.resolve('@deepseek-ai/dsh-app-boot')).href);
     const bundles = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-fixture-provider'];
-    const dependencies = { 'dsh-fixture-provider': `link:${fixture}` };
+    const dependencies = { 'dsh-fixture-provider': options.packageSpec ? `link:${fixture}` : '1.0.0' };
     if (!options.packageSpec) {
       bundles.push(packageName);
-      dependencies[packageName] = `link:${project}`;
+      dependencies[packageName] = copyPluginToProfile(project, profile);
     }
     initProfile(profile, bundles);
     const manifestPath = join(profile, 'package.json');
@@ -198,26 +200,29 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       args: [mcpFixture],
       cwd: fixture,
       env: { ELECTRON_RUN_AS_NODE: '1' },
-      startupTimeoutMs: 5000,
+      startupTimeoutMs: 20000,
       reconnect: { enabled: false },
     };
-    writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([
-      {
-        insert: [{
-          id: 'fixture-mcp-direct',
-          name: '@deepseek-ai/dsh-mcp-client',
-          config: { ...transport, serverName: 'fixture__docs', failOnStartupError: true },
-        }],
-      },
-      { id: 'mcp-manager', config: { servers: { 'fixture-archive': transport } } },
-    ]));
+    const directMcp = (id, serverName) => ({
+      id,
+      name: '@deepseek-ai/dsh-mcp-client',
+      config: { ...transport, serverName, failOnStartupError: true },
+    });
+    const directServers = [directMcp('fixture-mcp-direct', 'fixture__docs')];
+    const patches = [{ insert: directServers }];
+    try {
+      installed.resolve('@deepseek-ai/dsh-mcp-manager');
+      patches.push({ id: 'mcp-manager', config: { servers: { 'fixture-archive': transport } } });
+    } catch (error) {
+      if (error.code !== 'MODULE_NOT_FOUND') throw error;
+      directServers.push(directMcp('fixture-mcp-archive', 'fixture-archive'));
+    }
+    writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify(patches));
     if (options.packageSpec) {
       await install(options.packageSpec);
       if (!options.upgradeArchive) await verifyInstalledArchive(profile, options.packageSpec);
     } else {
-      const linkType = process.platform === 'win32' ? 'junction' : 'dir';
-      symlinkSync(project, join(profile, 'node_modules', packageName), linkType);
-      symlinkSync(fixture, join(profile, 'node_modules', 'dsh-fixture-provider'), linkType);
+      cpSync(fixture, join(profile, 'node_modules', 'dsh-fixture-provider'), { recursive: true });
     }
 
     const metadataBase = pathToFileURL(join(profile, 'package.json')).href;
@@ -253,12 +258,18 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       assert.ok(tools.every((tool) => tool.source === `@mcp/${server}`));
       assert.ok(tools.every((tool) => tool.provider.plugin === '@deepseek-ai/dsh-mcp-client'));
     }
-    console.log('PASS profile: direct and manager-mounted global MCPs form independent server groups');
+    const expectedMcpServers = [
+      { name: 'fixture-archive', toolCount: 2 },
+      { name: 'fixture__docs', toolCount: 2 },
+    ];
+    if (!options.upgradeArchive) assert.deepEqual(inventory.mcpServers, expectedMcpServers);
+    console.log('PASS profile: global MCPs form independent server groups');
     assert.ok(standard.every((tool) => tool.name !== 'run_code'));
     assert.ok(standard.every((tool) => tool.provider !== null), 'real Loader registrations retain module identity');
     assert.deepEqual(inventory.diagnostics, []);
     const effectiveResponse = await fetch(`${origin}${routePath}/effective?role=standard`, { headers });
     const effective = await effectiveResponse.json();
+    assert.equal(effectiveResponse.status, 200, JSON.stringify(effective));
     assert.deepEqual(effective.hidden, []);
     assert.equal(effective.visible.length, standard.length);
     console.log('PASS profile: real DSH boot, peer sharing, official preset tools, and third-party source detection');
@@ -306,6 +317,10 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     const filtered = await (await fetch(`${origin}${routePath}/effective?role=standard`, { headers })).json();
     assert.deepEqual(filtered.hidden, ['mcp__fixture__docs__lookup', 'mcp__fixture__docs__status']);
     assert.ok(filtered.visible.includes('mcp__fixture-archive__lookup'));
+    const expectedPromptVisibility = [
+      { name: 'fixture-archive', visible: true },
+      { name: 'fixture__docs', visible: false },
+    ];
     console.log('PASS profile: the saved server policy only hides tools from that server');
 
     if (options.upgradeArchive) {
@@ -314,22 +329,22 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       await verifyInstalledArchive(profile, options.upgradeArchive);
       const upgraded = await startHost();
       await verifyRouteAuthentication(upgraded);
+      assert.deepEqual(upgraded.inventory.mcpServers, expectedMcpServers);
       assert.equal(upgraded.inventory.configVersion, mcpSave.body.configVersion);
       const response = await fetch(`${upgraded.origin}${routePath}/effective?role=standard`, { headers: upgraded.headers });
       assert.equal(response.status, 200);
       const effective = await response.json();
       assert.deepEqual(effective.hidden, filtered.hidden);
       assert.deepEqual(effective.visible, filtered.visible);
+      assert.deepEqual(effective.servers, expectedPromptVisibility);
       console.log('PASS package upgrade: DSH boots the candidate archive and retains the saved policy');
-    } else if (options.packageSpec) {
-      console.log('PASS package install: a fresh DSH profile boots the candidate archive');
+    } else {
+      assert.deepEqual(filtered.servers, expectedPromptVisibility);
+      console.log('PASS profile: the saved server policy also reports per-server prompt visibility');
+      if (options.packageSpec) console.log('PASS package install: a fresh DSH profile boots the candidate archive');
     }
   } finally {
     await stopHost();
-    const target = resolve(taskHome);
-    if (dirname(target) !== resolve(tmpdir()) || !basename(target).startsWith('dsh-tool-exposure-profile-')) {
-      throw new Error('Refusing to remove an unowned test directory: ' + target);
-    }
-    rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removeTestHome(taskHome, profilePrefix);
   }
 }

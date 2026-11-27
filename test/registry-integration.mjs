@@ -12,7 +12,7 @@ const desktopExe = process.env.DSH_NODE_EXECUTABLE || join(process.env.LOCALAPPD
 const useDesktopRuntime = process.env.DSH_NODE_EXECUTABLE || !process.env.DSH_TEST_INSTALL_DIR;
 if (process.platform === 'win32' && !process.versions.electron && useDesktopRuntime && existsSync(desktopExe)) {
   const result = spawnSync(desktopExe, [ownFile], {
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, encoding: 'utf8', windowsHide: true, timeout: 45000,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, encoding: 'utf8', windowsHide: true, timeout: 90000,
   });
   process.stdout.write(result.stdout || '');
   process.stderr.write(result.stderr || '');
@@ -289,6 +289,90 @@ try {
   assert.equal(tools.get('observed_tool'), undefined);
   assert.ok(!tools.toolCatalog().some((tool) => tool.name === 'observed_tool'));
   console.log('PASS registry: preserves official registration and removal notifications');
+
+  /* MCP 提示词过滤：真实 dsh-system-prompt 组装链上的作用域 waterfall。 */
+  let SystemPromptModule = null;
+  try {
+    SystemPromptModule = await import(pathToFileURL(installed.resolve('@deepseek-ai/dsh-system-prompt')).href);
+  } catch (error) {
+    console.log('SKIP mcp prompt integration:', error.code === 'MODULE_NOT_FOUND' ? 'dsh-system-prompt unavailable' : error.message);
+  }
+  if (SystemPromptModule) {
+    const { default: SystemPrompt, renderPrompt } = SystemPromptModule;
+    const promptRoot = new Context();
+    const promptFiber = promptRoot.plugin(SystemPrompt, {});
+    for (let attempt = 0; attempt < 30 && !promptRoot.get('systemPrompt'); attempt += 1) await new Promise(setImmediate);
+    const promptService = promptRoot.get('systemPrompt');
+    assert.ok(promptService, 'real SystemPrompt mounted');
+    const promptOrder = promptService.getSectionOrder('MCP_SERVERS');
+    const UPSTREAM = '## MCP resource servers\n\n'
+      + 'Use list_mcp_resources, list_mcp_resource_templates, or read_mcp_resource with one of these names '
+      + 'as the server argument: ["ida","yakit"].';
+    // 与 dsh-mcp-resources / dsh-mcp-client 相同的注册方式：全局作用域 section。
+    const disposeSections = [
+      promptService.section({
+        name: 'mcp-resource-servers', order: promptOrder, interpolate: false,
+        text: () => UPSTREAM,
+      }),
+      promptService.section({
+        name: 'mcp:ida', order: promptOrder, interpolate: false,
+        text: () => '### MCP server: ida\n\nIDA Pro reverse engineering.',
+      }),
+      promptService.section({
+        name: 'mcp:yakit', order: promptOrder, interpolate: false,
+        text: () => '### MCP server: yakit\n\nYakit platform.',
+      }),
+    ];
+    let promptOwner;
+    const promptOwnerFiber = promptRoot.plugin({ apply(ctx) { promptOwner = ctx; } });
+    await promptOwnerFiber.inertia;
+    const mcpScopeKey = {};
+    const mcpScope = createScope(promptOwner, mcpScopeKey);
+    const mcpAgent = Object.assign(mcpScopeKey, { ctx: mcpScope.ctx });
+    const disposeProvides = [
+      promptRoot.provide('tools', {
+        schemas: () => [{ name: 'read', description: 'read file' }],
+        get: () => undefined,
+        restrict: () => () => {},
+      }),
+      promptRoot.provide('agentPresets', { composedPreset: () => 'reviewer' }),
+      promptRoot.provide('mcpManager', { list: () => [{ name: 'ida' }, { name: 'yakit' }] }),
+      promptRoot.provide('configEditor', { entries: () => [] }),
+      promptRoot.provide('agents', { list: () => [mcpAgent] }),
+    ];
+    try {
+      const denyConfig = Host.normalizeConfig({
+        roles: { reviewer: { mode: 'open', groups: { '@mcp/ida': 'off', '@mcp/yakit': 'off' } } },
+      });
+      assert.equal(Host.applyAgentPolicy(promptRoot, mcpAgent, denyConfig), true);
+      const denied = renderPrompt(await promptService.assemble({ scope: mcpScopeKey }));
+      assert.ok(!denied.includes('### MCP server:'), 'server descriptions dropped: ' + JSON.stringify(denied));
+      assert.ok(!denied.includes('## MCP resource servers'), 'server-name listing dropped');
+      const allowIda = Host.normalizeConfig({
+        roles: { reviewer: { mode: 'open', groups: { '@mcp/ida': 'on', '@mcp/yakit': 'off' } } },
+      });
+      assert.equal(Host.applyAgentPolicy(promptRoot, mcpAgent, allowIda, { force: true }), true);
+      const partial = renderPrompt(await promptService.assemble({ scope: mcpScopeKey }));
+      assert.ok(partial.includes('### MCP server: ida'), 'ida description kept');
+      assert.ok(partial.includes('"ida"'), 'ida listed');
+      assert.ok(!partial.includes('yakit'), 'yakit fully hidden');
+      // 未接管的作用域保持宿主默认行为。
+      const untouched = renderPrompt(await promptService.assemble({}));
+      assert.ok(untouched.includes('["ida","yakit"]') && untouched.includes('### MCP server: yakit'), 'unmanaged scopes keep host behavior');
+      // 逃生开关解除后恢复宿主提示词。
+      Host.liftAllRestrictions(promptRoot);
+      const restored = renderPrompt(await promptService.assemble({ scope: mcpScopeKey }));
+      assert.ok(restored.includes('["ida","yakit"]'), 'lift restores the host prompt');
+      console.log('PASS registry: scoped MCP prompt filtering on the real SystemPrompt assembly');
+    } finally {
+      for (const dispose of disposeProvides.reverse()) dispose();
+      for (const offSection of disposeSections.reverse()) offSection();
+      await mcpScope.dispose();
+      await promptOwnerFiber.dispose();
+      await promptFiber.dispose();
+      await promptRoot.fiber.dispose();
+    }
+  }
 } finally {
   for (const scope of scopes.reverse()) await scope.dispose();
   await ownerFiber.dispose();

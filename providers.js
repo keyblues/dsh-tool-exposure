@@ -1,6 +1,7 @@
 const MCP_CLIENT = '@deepseek-ai/dsh-mcp-client';
 const MCP_MANAGER = '@deepseek-ai/dsh-mcp-manager';
-const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/;
+/** Server names DSH accepts for MCP clients; reused for prompt-section names. */
+export const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/;
 
 /** Identify a tool's registering plugin from its Cordis Loader context. */
 export function providerFromContext(ctx, scope, toolName) {
